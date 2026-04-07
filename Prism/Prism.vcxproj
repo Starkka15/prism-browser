@@ -53,9 +53,13 @@
 
   <PropertyGroup Label="UserMacros" />
 
-  <!-- ── No XAML: disable the XAML compiler pipeline entirely ─────────────── -->
+  <!-- ── No XAML: disable the entire XAML compiler pipeline ──────────────── -->
   <PropertyGroup>
     <DisableXbfGeneration>true</DisableXbfGeneration>
+    <GenerateXbfFiles>false</GenerateXbfFiles>
+    <XamlApplicationClass></XamlApplicationClass>
+    <EnableXAMLDiagnostics>false</EnableXAMLDiagnostics>
+    <XamlRootClass></XamlRootClass>
   </PropertyGroup>
 
   <!-- ── Paths ─────────────────────────────────────────────────────────────── -->
@@ -176,7 +180,8 @@
   </Target>
   <ImportGroup Label="ExtensionTargets" />
 
-  <!-- ── No XAML in this project — suppress the CompileXaml task ───────────── -->
+  <!-- ── No XAML: suppress the targets that invoke the CompileXaml task ──── -->
   <Target Name="CompileXaml" />
+  <Target Name="_OnXamlPreCompileError" />
 
 </Project>

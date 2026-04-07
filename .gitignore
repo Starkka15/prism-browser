@@ -13,8 +13,8 @@ Prism/*.cer
 # ARM32 prebuilt headers/libs (large, machine-generated)
 arm32/
 
-# WebKit source (clone separately)
-deps/webkit/
+# Dependency sources (clone/download separately)
+deps/src/
 
 # User-specific VS files
 Prism/*.vcxproj.user

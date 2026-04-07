@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:mp="http://schemas.microsoft.com/appx/2014/phone/manifest"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  IgnorableNamespaces="uap mp">
+
+  <Identity
+    Name="PrismBrowser"
+    Publisher="CN=Prism"
+    Version="1.0.0.0"
+    ProcessorArchitecture="arm" />
+
+  <mp:PhoneIdentity
+    PhoneProductId="a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+    PhonePublisherId="00000000-0000-0000-0000-000000000000" />
+
+  <Properties>
+    <DisplayName>Prism</DisplayName>
+    <PublisherDisplayName>Prism</PublisherDisplayName>
+    <Logo>assets\Logo.png</Logo>
+  </Properties>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Universal"
+                        MinVersion="10.0.10240.0"
+                        MaxVersionTested="10.0.16299.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Applications>
+    <Application Id="App"
+      Executable="Prism.exe"
+      EntryPoint="Prism.App">
+      <uap:VisualElements
+        DisplayName="Prism"
+        Square150x150Logo="assets\Logo.png"
+        Square44x44Logo="assets\SmallLogo.png"
+        Description="WebKit-based browser for Windows 10 Mobile"
+        BackgroundColor="#000000">
+        <uap:SplashScreen Image="assets\SplashScreen.png" />
+      </uap:VisualElements>
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <Capability Name="internetClient" />
+  </Capabilities>
+
+</Package>

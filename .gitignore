@@ -1,0 +1,25 @@
+# Build outputs
+deps/build/
+deps/build-logs/
+Prism/Debug/
+Prism/Release/
+Prism/obj/
+Prism/build/
+Prism/Generated\ Files/
+Prism/*.appx
+Prism/*.appxupload
+Prism/*.cer
+
+# ARM32 prebuilt headers/libs (large, machine-generated)
+arm32/
+
+# WebKit source (clone separately)
+deps/webkit/
+
+# User-specific VS files
+Prism/*.vcxproj.user
+Prism/.vs/
+.vs/
+
+# Logs
+*.log

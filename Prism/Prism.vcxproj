@@ -1,0 +1,182 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Release|ARM">
+      <Configuration>Release</Configuration>
+      <Platform>ARM</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Debug|ARM">
+      <Configuration>Debug</Configuration>
+      <Platform>ARM</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}</ProjectGuid>
+    <RootNamespace>Prism</RootNamespace>
+    <DefaultLanguage>en-US</DefaultLanguage>
+    <MinimumVisualStudioVersion>15.0</MinimumVisualStudioVersion>
+    <AppContainerApplication>true</AppContainerApplication>
+    <ApplicationType>Windows Store</ApplicationType>
+    <ApplicationTypeRevision>10.0</ApplicationTypeRevision>
+    <!-- WRL works with 16299; no C++/WinRT dependency needed -->
+    <WindowsTargetPlatformVersion>10.0.16299.0</WindowsTargetPlatformVersion>
+    <WindowsTargetPlatformMinVersion>10.0.10240.0</WindowsTargetPlatformMinVersion>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Condition="'$(Configuration)'=='Release'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Debug'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings" />
+  <ImportGroup Label="Shared" />
+
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"
+            Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')"
+            Label="LocalAppDataPlatform" />
+  </ImportGroup>
+
+  <PropertyGroup Label="UserMacros" />
+
+  <!-- ── No XAML: disable the XAML compiler pipeline entirely ─────────────── -->
+  <PropertyGroup>
+    <DisableXbfGeneration>true</DisableXbfGeneration>
+  </PropertyGroup>
+
+  <!-- ── Paths ─────────────────────────────────────────────────────────────── -->
+  <PropertyGroup>
+    <WebKitBuildDir>Z:\prism-browser\deps\build\webkit-arm32</WebKitBuildDir>
+    <WebKitHeadersDir>$(WebKitBuildDir)\WebKit\Headers</WebKitHeadersDir>
+    <WebKitLibDir>$(WebKitBuildDir)\lib64</WebKitLibDir>
+    <WebKitBinDir>$(WebKitBuildDir)\bin64</WebKitBinDir>
+    <OutDir>$(SolutionDir)$(Configuration)\$(Platform)\</OutDir>
+    <IntDir>$(SolutionDir)obj\$(Configuration)\$(Platform)\</IntDir>
+  </PropertyGroup>
+
+  <!-- ── Compiler settings ───────────────────────────────��─────────────────── -->
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <PrecompiledHeader>Use</PrecompiledHeader>
+      <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
+      <AdditionalIncludeDirectories>
+        $(WebKitHeadersDir);
+        $(WebKitHeadersDir)\WebKit;
+        %(AdditionalIncludeDirectories)
+      </AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>
+        WIN32;
+        _WINDOWS;
+        UNICODE;
+        _UNICODE;
+        WINAPI_FAMILY=WINAPI_FAMILY_APP;
+        %(PreprocessorDefinitions)
+      </PreprocessorDefinitions>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <AdditionalOptions>/await %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <ClCompile Condition="'$(Configuration)'=='Release'">
+      <Optimization>MaxSpeed</Optimization>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+    </ClCompile>
+    <ClCompile Condition="'$(Configuration)'=='Debug'">
+      <Optimization>Disabled</Optimization>
+      <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
+    </ClCompile>
+
+    <!-- ── Linker ─────────────────────────────────────────────────────────── -->
+    <Link>
+      <AdditionalLibraryDirectories>
+        $(WebKitLibDir);
+        %(AdditionalLibraryDirectories)
+      </AdditionalLibraryDirectories>
+      <AdditionalDependencies>
+        WebKit2.lib;
+        JavaScriptCore.lib;
+        WTF.lib;
+        WindowsApp.lib;
+        comctl32.lib;
+        %(AdditionalDependencies)
+      </AdditionalDependencies>
+      <SubSystem>Windows</SubSystem>
+      <EntryPointSymbol>wWinMainCRTStartup</EntryPointSymbol>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <!-- ── Source files ──────────────────────────────────────────────────────── -->
+  <ItemGroup>
+    <ClCompile Include="pch.cpp">
+      <PrecompiledHeader>Create</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="App.cpp" />
+    <ClCompile Include="BrowserPage.cpp" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ClInclude Include="pch.h" />
+    <ClInclude Include="BrowserPage.h" />
+  </ItemGroup>
+
+  <!-- ── AppX manifest ─────────────────────────────────────────────────────── -->
+  <ItemGroup>
+    <AppxManifest Include="Package.appxmanifest" />
+  </ItemGroup>
+
+  <!-- ── Assets ────────────────────────────────────────────────────────────── -->
+  <ItemGroup>
+    <Image Include="assets\Logo.png" />
+    <Image Include="assets\SmallLogo.png" />
+    <Image Include="assets\SplashScreen.png" />
+  </ItemGroup>
+
+  <!-- ── WebKit DLLs — copied to app package output ────────────────────────── -->
+  <ItemGroup>
+    <None Include="$(WebKitBinDir)\WebKit2.dll">
+      <DeploymentContent>true</DeploymentContent>
+      <Link>WebKit2.dll</Link>
+    </None>
+    <None Include="$(WebKitBinDir)\JavaScriptCore.dll">
+      <DeploymentContent>true</DeploymentContent>
+      <Link>JavaScriptCore.dll</Link>
+    </None>
+    <None Include="$(WebKitBinDir)\WTF.dll">
+      <DeploymentContent>true</DeploymentContent>
+      <Link>WTF.dll</Link>
+    </None>
+    <None Include="$(WebKitBinDir)\libEGL.dll">
+      <DeploymentContent>true</DeploymentContent>
+      <Link>libEGL.dll</Link>
+    </None>
+    <None Include="$(WebKitBinDir)\libGLESv2.dll">
+      <DeploymentContent>true</DeploymentContent>
+      <Link>libGLESv2.dll</Link>
+    </None>
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+
+  <!-- ── Copy WebKit.resources to AppX output (skips cmake sidecar files) ─── -->
+  <Target Name="CopyWebKitResources" AfterTargets="Build">
+    <Exec Command="robocopy &quot;$(WebKitBinDir)\WebKit.resources&quot; &quot;$(OutDir)\WebKit.resources&quot; /E /XF &quot;*:*&quot; /NFL /NDL /NJH /NJS &amp;&amp; exit 0 || exit 0" />
+  </Target>
+  <ImportGroup Label="ExtensionTargets" />
+
+  <!-- ── No XAML in this project — suppress the CompileXaml task ───────────── -->
+  <Target Name="CompileXaml" />
+
+</Project>

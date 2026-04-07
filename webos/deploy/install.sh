@@ -3,7 +3,7 @@
 set -e
 
 OUT="$(cd "$(dirname "$0")/../out" && pwd)"
-DEVICE="FranksHPTouchPad"
+DEVICE="${WEBOS_DEVICE:-touchpad}"  # set WEBOS_DEVICE env var or pass as arg
 INSTALL_PATH="/media/internal/prism"
 
 echo "Deploying to $DEVICE..."

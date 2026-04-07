@@ -23,3 +23,8 @@ Prism/.vs/
 
 # Logs
 *.log
+
+# webOS build artifacts (large, generated)
+webos/build/
+webos/out/
+webos/deps/

@@ -17,7 +17,7 @@ export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
 export PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig:$SYSROOT/usr/lib/pkgconfig"
 
 KHRONOS="$SCRIPT_DIR/deps/khronos"
-CFLAGS="-march=armv7-a -mtune=cortex-a9 -mfpu=neon -mfloat-abi=softfp -O2 --sysroot=$SYSROOT -I$KHRONOS -I$PDK/include"
+CFLAGS="-march=armv7-a -mtune=cortex-a9 -mfpu=neon -mfloat-abi=softfp -O2 --sysroot=$SYSROOT -I$KHRONOS -I$PDK/include -DWEBOS_EGL_UNVERSIONED"
 LDFLAGS="--sysroot=$SYSROOT -L$PDK/device/lib -L$SYSROOT/usr/lib"
 
 if [ ! -d "$SRC" ]; then

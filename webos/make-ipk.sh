@@ -15,7 +15,13 @@ OUTDIR="$SCRIPT_DIR/build"
 echo "=== Prism Browser IPK builder ==="
 
 # ── 1. Prepare app directory ───────────────────────────────────────────────
-rm -rf "$APPDIR" && mkdir -p "$APPDIR/lib" "$APPDIR/libexec"
+rm -rf "$APPDIR" && mkdir -p "$APPDIR/lib" "$APPDIR/lib/gio/modules" "$APPDIR/libexec" "$APPDIR/etc/fonts" "$APPDIR/certs"
+
+# Copy fontconfig config (searches device system fonts + temp cache)
+cp "$SCRIPT_DIR/bundle-extras/etc/fonts/fonts.conf" "$APPDIR/etc/fonts/"
+
+# CA certificate bundle (GnuTLS looks for /tmp/prism-ca.crt; wrapper copies it there)
+cp /etc/ssl/certs/ca-certificates.crt "$APPDIR/certs/ca-certificates.crt"
 
 # ── 2. appinfo.json ────────────────────────────────────────────────────────
 cat > "$APPDIR/appinfo.json" << APPINFO
@@ -35,13 +41,41 @@ APPINFO
 cat > "$APPDIR/prism" << 'WRAPPER'
 #!/bin/sh
 # Prism Browser launcher
-D=$(dirname "$(readlink -f "$0")")
+
+# Resolve our install directory.
+# $0 may be an absolute path (SysMgr), a relative path, or just the filename.
+# We try $0 first; if readlink -f is unavailable or gives a bad result,
+# webOS SysMgr sets HOME to the app directory for PDK apps — use that fallback.
+_self="$0"
+if [ "${_self#/}" = "$_self" ]; then
+    # not absolute — make it relative to CWD
+    _self="$PWD/$_self"
+fi
+D=$(dirname "$_self")
+# If the binary isn't where we expect, trust $HOME (set by SysMgr to app dir)
+if [ ! -x "$D/prism-browser" ] && [ -x "$HOME/prism-browser" ]; then
+    D="$HOME"
+fi
+
+# Log to /tmp/prism.log so we can inspect launcher launches (no TTY)
+exec 2>>/tmp/prism.log
+echo "=== prism started: $(date) D=$D ===" >&2
+
 export LD_LIBRARY_PATH="$D/lib:$LD_LIBRARY_PATH"
 export WPE_BACKEND="$D/lib/libWPEBackend-sdl.so.0"
 export WEBKIT_WEBPROCESS_PATH="$D/libexec/WPEWebProcess"
 export WEBKIT_NETWORKPROCESS_PATH="$D/libexec/WPENetworkProcess"
 export WEBKIT_EXEC_PATH="$D/libexec"
-exec "$D/prism-browser" "${@:-https://start.duckduckgo.com}"
+# LD_PRELOAD shim (currently passive — just marks load order)
+export LD_PRELOAD="$D/lib/libswap-hook.so"
+# Fontconfig: use our config that also searches the device's system fonts
+export FONTCONFIG_PATH="$D/etc/fonts"
+export FONTCONFIG_FILE="$D/etc/fonts/fonts.conf"
+# GIO modules path for TLS (glib-networking, when available)
+export GIO_MODULE_DIR="$D/lib/gio/modules"
+# GnuTLS CA trust store — copy bundled certs to the path compiled into libgnutls
+cp "$D/certs/ca-certificates.crt" /tmp/prism-ca.crt 2>/dev/null || true
+exec "$D/prism-browser" "${@:-http://info.cern.ch}"
 WRAPPER
 chmod 755 "$APPDIR/prism"
 
@@ -96,6 +130,14 @@ SHIP_LIBS=(
     "libexpat.so.1.9.2"
     # C++ runtime (device has GCC 4.3, our code needs GCC 10 symbols)
     "libstdc++.so.6.0.28"
+    # LD_PRELOAD shim for FBO redirect + pixel readback
+    "libswap-hook.so"
+    # TLS stack: GnuTLS + dependencies (for glib-networking GIO module)
+    "libgmp.so.10.5.0"
+    "libnettle.so.8.8"
+    "libhogweed.so.6.8"
+    "libtasn1.so.6.6.3"
+    "libgnutls.so.30.38.0"
 )
 
 for sofile in "${SHIP_LIBS[@]}"; do
@@ -127,7 +169,20 @@ for versioned in "$APPDIR/lib"/*.so.*.*; do
     fi
 done
 
-# ── 6. Placeholder icon (replace with real 64x64 PNG later) ───────────────
+# ── 6. GIO modules (TLS backend: libgiognutls.so) ─────────────────────────
+GIO_MOD_SRC="$OUT/lib/gio/modules"
+if [ -d "$GIO_MOD_SRC" ]; then
+    for mod in "$GIO_MOD_SRC"/*.so; do
+        [ -f "$mod" ] || continue
+        cp "$mod" "$APPDIR/lib/gio/modules/"
+        $STRIP --strip-unneeded "$APPDIR/lib/gio/modules/$(basename "$mod")" 2>/dev/null || true
+        echo "GIO module: $(basename "$mod")"
+    done
+else
+    echo "NOTE: $GIO_MOD_SRC not found — TLS not available (build glib-networking first)"
+fi
+
+# ── 7. Placeholder icon (replace with real 64x64 PNG later) ───────────────
 if [ -f "$SCRIPT_DIR/icon.png" ]; then
     cp "$SCRIPT_DIR/icon.png" "$APPDIR/"
 else

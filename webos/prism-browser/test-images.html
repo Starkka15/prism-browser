@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=1024">
+<title>Image Format Test</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:#1a1a1a; color:#e0e0e0; font-family:sans-serif; padding:12px; }
+h1 { font-size:20px; color:#4a9fd5; margin-bottom:12px; }
+.grid { display:flex; flex-wrap:wrap; gap:10px; }
+.cell { background:#2e2e2e; border-radius:6px; padding:8px; width:180px; }
+.cell label { font-size:11px; color:#aaa; display:block; margin-bottom:4px; }
+.box { width:160px; height:60px; background:#444; display:flex;
+       align-items:center; justify-content:center; overflow:hidden; }
+.box img { max-width:100%; max-height:100%; }
+.result { font-size:12px; margin-top:4px; }
+.ok { color:#4d4; }
+.fail { color:#d44; }
+</style>
+</head>
+<body>
+<h1>Image Format Test — Prism Browser</h1>
+<p style="font-size:12px;color:#888;margin-bottom:10px">Each box should show a colored square. "FAIL" = image format broken.</p>
+<div class="grid">
+
+<div class="cell">
+  <label>PNG RGB (20x20 red)</label>
+  <div class="box" id="b1"><img id="i1" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABQAAAAUCAIAAAAC64paAAAAG0lEQVR4nGP4z8BANiJf56jmUc2jmkc1U0UzADHNjoAymaoJAAAAAElFTkSuQmCC" onload="ok(1)" onerror="fail(1)"></div>
+  <div class="result" id="r1">waiting…</div>
+</div>
+
+<div class="cell">
+  <label>PNG RGBA opaque (20x20 red)</label>
+  <div class="box" id="b2"><img id="i2" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABQAAAAUCAYAAACNiR0NAAAAHklEQVR4nGP4z8Dwn5qYYdTAUQNHDRw1cNTAkWogAPbLHQ6m4Q56AAAAAElFTkSuQmCC" onload="ok(2)" onerror="fail(2)"></div>
+  <div class="result" id="r2">waiting…</div>
+</div>
+
+<div class="cell">
+  <label>PNG RGBA semi-transparent (red/50%)</label>
+  <div class="box" id="b3" style="background:#000"><img id="i3" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABQAAAAUCAYAAACNiR0NAAAAHklEQVR4nGP4z8DQQE3MMGrgqIGjBo4aOGrgSDUQAB1lVo9NP7HCAAAAAElFTkSuQmCC" onload="ok(3)" onerror="fail(3)"></div>
+  <div class="result" id="r3">waiting…</div>
+</div>
+
+<div class="cell">
+  <label>PNG blue (20x20)</label>
+  <div class="box" id="b4"><img id="i4" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABQAAAAUCAIAAAAC64paAAAAGUlEQVR4nGNgYPhPARrVPKp5VPOo5gHVDAAUwI6AVu8gqwAAAABJRU5ErkJggg==" onload="ok(4)" onerror="fail(4)"></div>
+  <div class="result" id="r4">waiting…</div>
+</div>
+
+<div class="cell">
+  <label>CSS background-image PNG</label>
+  <div class="box" id="b5" style="background-image:url('data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABQAAAAUCAIAAAAC64paAAAAG0lEQVR4nGP4z8BANiJf56jmUc2jmkc1U0UzADHNjoAymaoJAAAAAElFTkSuQmCC');background-size:cover;"></div>
+  <div class="result" id="r5"><span id="s5">check manually</span></div>
+</div>
+
+<div class="cell">
+  <label>Inline SVG (no filters)</label>
+  <div class="box" id="b6">
+    <svg width="60" height="60" xmlns="http://www.w3.org/2000/svg">
+      <rect width="60" height="60" fill="#00aa44"/>
+      <text x="30" y="35" text-anchor="middle" fill="white" font-size="12">SVG</text>
+    </svg>
+  </div>
+  <div class="result ok">inline — always works</div>
+</div>
+
+<div class="cell">
+  <label>SVG img tag (no filters)</label>
+  <div class="box" id="b7"><img id="i7" src="data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iNjAiIGhlaWdodD0iNjAiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+PHJlY3Qgd2lkdGg9IjYwIiBoZWlnaHQ9IjYwIiBmaWxsPSIjZmY4OTAwIi8+PHRleHQgeD0iMzAiIHk9IjM1IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmaWxsPSJ3aGl0ZSIgZm9udC1zaXplPSIxMiI+U1ZHPC90ZXh0Pjwvc3ZnPg==" onload="ok(7)" onerror="fail(7)"></div>
+  <div class="result" id="r7">waiting…</div>
+</div>
+
+<div class="cell">
+  <label>SVG img tag (feGaussianBlur)</label>
+  <div class="box" id="b8"><img id="i8" src="data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iNjAiIGhlaWdodD0iNjAiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+PGRlZnM+PGZpbHRlciBpZD0iYiI+PGZlR2F1c3NpYW5CbHVyIHN0ZERldmlhdGlvbj0iMiIvPjwvZmlsdGVyPjwvZGVmcz48cmVjdCB3aWR0aD0iNjAiIGhlaWdodD0iNjAiIGZpbGw9IiM4ODIyZmYiIGZpbHRlcj0idXJsKCNiKSIvPjwvc3ZnPg==" onload="ok(8)" onerror="fail(8)"></div>
+  <div class="result" id="r8">waiting…</div>
+</div>
+
+<div class="cell">
+  <label>WebP (20x20 green)</label>
+  <div class="box" id="b9"><img id="i9" src="data:image/webp;base64,UklGRlYAAABXRUJQVlA4IEoAAADQAQCdASoUABQAAUAmJZQCdAEO/gHOAADA/sWNAAAA" onload="ok(9)" onerror="fail(9)"></div>
+  <div class="result" id="r9">waiting…</div>
+</div>
+
+<div class="cell">
+  <label>JPEG 1x1 pixel</label>
+  <div class="box" id="b10"><img id="i10" src="data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wAALCAABAAEBAREA/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/9oACAEBAAA/APvY/9k=" onload="ok(10)" onerror="fail(10)"></div>
+  <div class="result" id="r10">waiting…</div>
+</div>
+
+</div>
+
+<div id="summary" style="margin-top:16px;font-size:14px;background:#2e2e2e;padding:10px;border-radius:6px;"></div>
+
+<script>
+var results = {};
+function ok(n) {
+  results[n] = true;
+  document.getElementById('r' + n).innerHTML = '<span style="color:#4d4">LOADED</span>';
+  update();
+}
+function fail(n) {
+  results[n] = false;
+  document.getElementById('r' + n).innerHTML = '<span style="color:#d44">ERROR</span>';
+  update();
+}
+function update() {
+  var ok_list = [], fail_list = [];
+  for (var k in results) {
+    if (results[k]) ok_list.push(k); else fail_list.push(k);
+  }
+  document.getElementById('summary').innerHTML =
+    'OK: ' + (ok_list.join(', ') || 'none') +
+    '<br>FAIL: ' + (fail_list.join(', ') || 'none');
+}
+// After 3s, mark any unresponded as timeout
+setTimeout(function() {
+  [1,2,3,4,7,8,9,10].forEach(function(n) {
+    if (!(n in results)) {
+      document.getElementById('r' + n).innerHTML = '<span style="color:#fa0">TIMEOUT</span>';
+      results[n] = null;
+      update();
+    }
+  });
+}, 3000);
+</script>
+</body>
+</html>

@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=1024">
+<title>Prism Browser</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body {
+  background: #1a1a1a;
+  color: #e0e0e0;
+  font-family: sans-serif;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100vh;
+  gap: 32px;
+}
+h1 {
+  font-size: 48px;
+  font-weight: 300;
+  letter-spacing: 4px;
+  color: #4a9fd5;
+}
+h1 span { color: #e0e0e0; }
+form {
+  display: flex;
+  gap: 10px;
+  width: 600px;
+}
+input[type=text] {
+  flex: 1;
+  padding: 14px 18px;
+  font-size: 20px;
+  border: none;
+  border-radius: 8px;
+  background: #2e2e2e;
+  color: #e0e0e0;
+  outline: none;
+}
+input[type=text]:focus { background: #3a3a3a; }
+button {
+  padding: 14px 24px;
+  font-size: 20px;
+  border: none;
+  border-radius: 8px;
+  background: #4a9fd5;
+  color: #fff;
+  cursor: pointer;
+}
+button:active { background: #3a8fc5; }
+.links {
+  display: flex;
+  gap: 24px;
+  font-size: 16px;
+}
+.links a {
+  color: #4a9fd5;
+  text-decoration: none;
+  padding: 8px 14px;
+  border-radius: 6px;
+  background: #2e2e2e;
+}
+.links a:active { background: #3a3a3a; }
+</style>
+</head>
+<body>
+<h1>PRISM <span>BROWSER</span></h1>
+<form onsubmit="go(event)">
+  <input type="text" id="q" placeholder="Search or enter address" autofocus>
+  <button type="submit">Go</button>
+</form>
+<div class="links">
+  <a href="https://lite.duckduckgo.com/lite/">DuckDuckGo</a>
+  <a href="https://wikipedia.org">Wikipedia</a>
+  <a href="https://news.ycombinator.com">Hacker News</a>
+  <a href="https://archive.org">Archive.org</a>
+  <a href="file:///media/internal/prism/bookmarks.html">Bookmarks</a>
+  <a href="test-images.html" style="background:#3a2a2a;color:#fa0">Image Test</a>
+</div>
+<script>
+function go(e) {
+  e.preventDefault();
+  var q = document.getElementById('q').value.trim();
+  if (!q) return;
+  if (q.indexOf('://') !== -1) { location.href = q; return; }
+  if (q.indexOf('.') !== -1 || q === 'localhost') {
+    location.href = 'https://' + q; return;
+  }
+  location.href = 'https://lite.duckduckgo.com/lite/?q=' + encodeURIComponent(q);
+}
+</script>
+</body>
+</html>

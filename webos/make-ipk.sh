@@ -15,7 +15,7 @@ OUTDIR="$SCRIPT_DIR/build"
 echo "=== Prism Browser IPK builder ==="
 
 # ── 1. Prepare app directory ───────────────────────────────────────────────
-rm -rf "$APPDIR" && mkdir -p "$APPDIR/lib" "$APPDIR/lib/gio/modules" "$APPDIR/libexec" "$APPDIR/etc/fonts" "$APPDIR/certs"
+rm -rf "$APPDIR" && mkdir -p "$APPDIR/lib" "$APPDIR/lib/gio/modules" "$APPDIR/lib/gstreamer-1.0" "$APPDIR/libexec" "$APPDIR/etc/fonts" "$APPDIR/certs"
 
 # Copy fontconfig config (searches device system fonts + temp cache)
 cp "$SCRIPT_DIR/bundle-extras/etc/fonts/fonts.conf" "$APPDIR/etc/fonts/"
@@ -60,6 +60,18 @@ fi
 # Log to /tmp/prism.log so we can inspect launcher launches (no TTY)
 exec 2>>/tmp/prism.log
 echo "=== prism started: $(date) D=$D ===" >&2
+echo "  user: $(id 2>&1)" >&2
+
+# GLib gspawn opens /dev/null O_RDONLY for child stdin — ensure accessible.
+# In the palm-launch sandbox /dev/null may be mode 000; fix it.
+chmod 666 /dev/null 2>>/tmp/prism.log || true
+
+# Open media hardware device nodes to all — required for Qualcomm OMX
+# (libOmxCore.so allocates pmem via /dev/pmem_adsp; decoder uses /dev/msm_vidc_dec)
+# These are group 'luna'; we need rw access regardless of our group.
+chmod a+rw /dev/pmem_adsp /dev/msm_vidc_dec 2>/dev/null && \
+    echo "  media devices opened OK" >&2 || \
+    echo "  WARNING: could not chmod media devices (not root?)" >&2
 
 export LD_LIBRARY_PATH="$D/lib:$LD_LIBRARY_PATH"
 export WPE_BACKEND="$D/lib/libWPEBackend-sdl.so.0"
@@ -73,11 +85,41 @@ export FONTCONFIG_PATH="$D/etc/fonts"
 export FONTCONFIG_FILE="$D/etc/fonts/fonts.conf"
 # GIO modules path for TLS (glib-networking, when available)
 export GIO_MODULE_DIR="$D/lib/gio/modules"
+# Limit JS heap to reduce "too many cards" OOM kills on heavy sites.
+# JSC_OPTIONS is read by every JSC process (browser + WPEWebProcess).
+export JSC_OPTIONS="--maxHeapSize=64 --useDFGJIT=false"
 # GnuTLS CA trust store — copy bundled certs to the path compiled into libgnutls
-cp "$D/certs/ca-certificates.crt" /tmp/prism-ca.crt 2>/dev/null || true
-exec "$D/prism-browser" "${@:-http://info.cern.ch}"
+cp "$D/certs/ca-certificates.crt" /tmp/prism-ca.crt || true
+# GStreamer plugin path — only our bundled plugins, no system 0.10 plugins
+export GST_PLUGIN_PATH="$D/lib/gstreamer-1.0"
+export GST_PLUGIN_SYSTEM_PATH="$D/lib/gstreamer-1.0"
+export GST_PLUGIN_SCANNER="$D/libexec/gst-plugin-scanner"
+export GST_REGISTRY="/tmp/prism-gst-registry.bin"
+# Disable registry scanning of system GStreamer 0.10 paths
+export GST_PLUGIN_PATH_1_0="$D/lib/gstreamer-1.0"
+# GStreamer debug — log to /tmp/prism-gst.log (remove or set to 0 for production)
+export GST_DEBUG="3,palmvideodec:5,playbin:4,uridecodebin:4,decodebin:4"
+export GST_DEBUG_FILE="/tmp/prism-gst.log"
+export GST_DEBUG_NO_COLOR=1
+
+# Pre-create shared framebuffer so WPEWebProcess (different uid) can open it O_RDWR.
+# Without this, open() fails with EACCES if the file was previously created by root.
+rm -f /tmp/prism-fb
+touch /tmp/prism-fb && chmod 666 /tmp/prism-fb || true
+
+# webOS launcher passes params as JSON (e.g. '{ }' or '{"target":"http://..."}').
+# Extract a real URL if present; otherwise load the home page.
+_url="file://$D/home.html"
+case "${1:-}" in
+    http://*|https://*|file://*) _url="$1" ;;
+esac
+exec "$D/prism-browser" "$_url"
 WRAPPER
 chmod 755 "$APPDIR/prism"
+
+# ── 3b. Home page ─────────────────────────────────────────────────────────
+cp "$SCRIPT_DIR/prism-browser/home.html"        "$APPDIR/"
+cp "$SCRIPT_DIR/prism-browser/test-images.html" "$APPDIR/"
 
 # ── 4. Executables ─────────────────────────────────────────────────────────
 install -m 755 "$OUT/bin/prism-browser"                         "$APPDIR/"
@@ -132,6 +174,26 @@ SHIP_LIBS=(
     "libstdc++.so.6.0.28"
     # LD_PRELOAD shim for FBO redirect + pixel readback
     "libswap-hook.so"
+    # GStreamer 1.18.6 core + base libraries
+    "libgstreamer-1.0.so.0.1806.0"
+    "libgstbase-1.0.so.0.1806.0"
+    "libgstapp-1.0.so.0.1806.0"
+    "libgstvideo-1.0.so.0.1806.0"
+    "libgstaudio-1.0.so.0.1806.0"
+    "libgstpbutils-1.0.so.0.1806.0"
+    "libgsttag-1.0.so.0.1806.0"
+    "libgstallocators-1.0.so.0.1806.0"
+    "libgstnet-1.0.so.0.1806.0"
+    "libgstfft-1.0.so.0.1806.0"
+    "libgstcontroller-1.0.so.0.1806.0"
+    "libgstrtp-1.0.so.0.1806.0"
+    "libgstriff-1.0.so.0.1806.0"
+    "libgstsdp-1.0.so.0.1806.0"
+    # FFmpeg 6.1 — provides AAC/MP3/Vorbis/H.264 software decode via gst-libav
+    "libavcodec.so.60.31.102"
+    "libavformat.so.60.16.100"
+    "libavutil.so.58.29.100"
+    "libswresample.so.4.12.100"
     # TLS stack: GnuTLS + dependencies (for glib-networking GIO module)
     "libgmp.so.10.5.0"
     "libnettle.so.8.8"
@@ -182,7 +244,58 @@ else
     echo "NOTE: $GIO_MOD_SRC not found — TLS not available (build glib-networking first)"
 fi
 
-# ── 7. Placeholder icon (replace with real 64x64 PNG later) ───────────────
+# ── 7. GStreamer plugins ───────────────────────────────────────────────────
+GST_PLUG_SRC="$OUT/lib/gstreamer-1.0"
+GST_PLUGINS=(
+    # Core
+    "libgstcoreelements.so"
+    "libgsttypefindfunctions.so"
+    "libgstapp.so"          # appsink/appsrc — required by WebKit media pipeline
+    # Playback pipeline
+    "libgstplayback.so"
+    "libgstaudioparsers.so"
+    "libgstaudioconvert.so"
+    "libgstaudioresample.so"
+    "libgstaudiorate.so"
+    "libgstaudiofx.so"      # scaletempo (playback rate), equalizer, etc.
+    "libgstvideoconvert.so"
+    "libgstvideoscale.so"
+    "libgstvideorate.so"
+    "libgstvolume.so"
+    "libgstautodetect.so"
+    # Demuxers / containers
+    "libgstisomp4.so"       # MP4/M4V/M4A
+    "libgstmatroska.so"     # WebM/MKV
+    "libgstsubparse.so"     # subtitles
+    # Network source
+    "libgstsoup.so"         # HTTP(S) streaming via libsoup
+    # Qualcomm HW video decoder
+    "gstpalmvideodec.so"
+    # FFmpeg-backed software decoders: AAC, MP3, Vorbis, H.264 fallback, etc.
+    "libgstlibav.so"
+)
+for plug in "${GST_PLUGINS[@]}"; do
+    src="$GST_PLUG_SRC/$plug"
+    if [ ! -f "$src" ]; then
+        echo "WARNING: missing GStreamer plugin $plug — skipping"
+        continue
+    fi
+    cp "$src" "$APPDIR/lib/gstreamer-1.0/"
+    $STRIP --strip-unneeded "$APPDIR/lib/gstreamer-1.0/$plug" 2>/dev/null || true
+    echo "GStreamer plugin: $plug"
+done
+
+# gst-plugin-scanner binary (needed for registry generation at first launch)
+GST_SCANNER="$OUT/libexec/gstreamer-1.0/gst-plugin-scanner"
+if [ -f "$GST_SCANNER" ]; then
+    install -m 755 "$GST_SCANNER" "$APPDIR/libexec/gst-plugin-scanner"
+    $STRIP --strip-unneeded "$APPDIR/libexec/gst-plugin-scanner" 2>/dev/null || true
+    echo "gst-plugin-scanner installed"
+else
+    echo "WARNING: gst-plugin-scanner not found at $GST_SCANNER"
+fi
+
+# ── 7b. Placeholder icon (replace with real 64x64 PNG later) ──────────────
 if [ -f "$SCRIPT_DIR/icon.png" ]; then
     cp "$SCRIPT_DIR/icon.png" "$APPDIR/"
 else
@@ -191,7 +304,7 @@ else
         > "$APPDIR/icon.png"
 fi
 
-# ── 7. Run palm-package ────────────────────────────────────────────────────
+# ── 8. Run palm-package ────────────────────────────────────────────────────
 DATA_SIZE=$(du -sh "$APPDIR" | cut -f1)
 echo "App directory: $DATA_SIZE"
 echo "Running palm-package..."

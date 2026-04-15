@@ -33,14 +33,25 @@ set(CMAKE_FIND_ROOT_PATH
     ${PDK}/device
 )
 set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+
+# Cross-compile emulator: allows ARM host tools (LLIntSettingsExtractor, etc.)
+# to run on x86_64 during the build.  Uses a wrapper that sets LD_LIBRARY_PATH
+# and substitutes a stub libicudata (the real one has misaligned ELF segments
+# built with 64 KB page size that QEMU/binfmt cannot mmap).
+set(CMAKE_CROSSCOMPILING_EMULATOR "$ENV{HOME}/prism-browser/webos/qemu-arm-wrapper.sh")
 # BOTH: search re-rooted paths AND the absolute HINTS from pkg-config
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY BOTH)
 set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE BOTH)
 set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE BOTH)
 
-# ARMv7-A, Cortex-A9 (Snapdragon APQ8060)
-set(CMAKE_C_FLAGS_INIT   "-march=armv7-a -mtune=cortex-a9 -mfpu=neon -mfloat-abi=softfp -I${PDK}/include -I${PDK}/include/SDL")
-set(CMAKE_CXX_FLAGS_INIT "-march=armv7-a -mtune=cortex-a9 -mfpu=neon -mfloat-abi=softfp -I${PDK}/include -I${PDK}/include/SDL")
+# ARMv7-A Thumb-2, Cortex-A9 (Snapdragon APQ8060)
+# -mthumb: emit Thumb-2 instructions; defines __thumb2__ which WebKit's cmake
+#   detects to enable the ARM JIT (ARM_THUMB2_DETECTED).  Without this flag
+#   the check fails and WebKit falls back to the slow CLoop interpreter.
+# -mthumb-interwork: allow safe calls between Thumb-2 and ARM code in the
+#   same process (system libs, PDK, EGL are all legacy ARM32).
+set(CMAKE_C_FLAGS_INIT   "-march=armv7-a -mtune=cortex-a9 -mthumb -mthumb-interwork -mfpu=neon -mfloat-abi=softfp -I${PDK}/include -I${PDK}/include/SDL")
+set(CMAKE_CXX_FLAGS_INIT "-march=armv7-a -mtune=cortex-a9 -mthumb -mthumb-interwork -mfpu=neon -mfloat-abi=softfp -I${PDK}/include -I${PDK}/include/SDL")
 
 link_directories(
     ${PDK}/device/lib

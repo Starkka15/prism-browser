@@ -36,7 +36,10 @@
 #include <unistd.h>
 #include <stdio.h>
 #include <fcntl.h>
+#include <errno.h>
 #include <sys/mman.h>
+#include <sys/socket.h>   /* recv, MSG_DONTWAIT */
+#include <sys/stat.h>     /* mkfifo */
 
 /* ── Renderer backend ───────────────────────────────────────────────────── */
 
@@ -102,14 +105,15 @@ renderer_target_create(struct wpe_renderer_backend_egl_target *wpe_target, int f
 {
     struct sdl_target *t = calloc(1, sizeof(*t));
     if (!t) return NULL;
-    t->wpe_target = wpe_target;
-    t->fd         = fd;
-    t->width      = WEBOS_SCREEN_W;
-    t->height     = WEBKIT_H;   /* 704 — chrome bar excluded */
-    t->pb_dpy     = EGL_NO_DISPLAY;
-    t->pb_surf    = EGL_NO_SURFACE;
-    t->pb_ctx     = EGL_NO_CONTEXT;
-    t->win_surf   = EGL_NO_SURFACE;
+    t->wpe_target     = wpe_target;
+    t->fd             = fd;
+    t->width          = 1024;   /* default; overridden by renderer_target_initialize */
+    t->height         = 704;    /* default; overridden by renderer_target_initialize */
+    t->pb_dpy         = EGL_NO_DISPLAY;
+    t->pb_surf        = EGL_NO_SURFACE;
+    t->pb_ctx         = EGL_NO_CONTEXT;
+    t->win_surf       = EGL_NO_SURFACE;
+    t->frame_fifo_fd  = -1;
     return t;
 }
 
@@ -118,12 +122,17 @@ renderer_target_destroy(void *data)
 {
     struct sdl_target *t = data;
     if (!t) return;
+    if (t->qcom_created_image != EGL_NO_IMAGE_KHR
+            && t->pfn_DestroyImage && t->pb_dpy != EGL_NO_DISPLAY)
+        t->pfn_DestroyImage(t->pb_dpy, t->qcom_created_image);
     if (t->pb_surf != EGL_NO_SURFACE && t->pb_dpy != EGL_NO_DISPLAY)
         eglDestroySurface(t->pb_dpy, t->pb_surf);
     if (t->fb_pixels)
         munmap(t->fb_pixels, t->fb_size);
     if (t->fb_fd >= 0)
         close(t->fb_fd);
+    if (t->frame_fifo_fd >= 0)
+        close(t->frame_fifo_fd);
     free(t);
 }
 
@@ -133,33 +142,51 @@ renderer_target_initialize(void *data, void *backend_data,
 {
     struct sdl_target *t = data;
     (void)backend_data;
-    t->width  = width  ? width  : WEBOS_SCREEN_W;
-    t->height = height ? height : WEBOS_SCREEN_H;
+    t->width  = width  ? width  : 1024;
+    t->height = height ? height : 704;
     fprintf(stderr, "[wpe-backend-sdl] renderer_target_initialize %ux%u\n",
             t->width, t->height);
 
     /*
-     * Create and map /tmp/prism-fb.  Written in frame_rendered via
-     * glReadPixels from the PBuffer; read by the UI process compositor.
+     * Receive 8-byte sync packet from UI (content ignored).
+     * Use MSG_DONTWAIT: for the first WebProcess the UI sends {0,0} and we
+     * receive it; for subsequent WebProcesses WPE may reuse this target or
+     * the fd may not have data yet — proceed regardless rather than blocking
+     * indefinitely or failing with EBADF when the fd is recycled.
      */
-    t->fb_size   = (size_t)t->width * t->height * 4; /* RGBA8 */
-    t->fb_fd     = open(PRISM_FB_PATH, O_CREAT | O_RDWR, 0600);
+    {
+        EGLint pkt[2] = { 0, 0 };
+        ssize_t n = recv(t->fd, pkt, sizeof(pkt), MSG_DONTWAIT);
+        fprintf(stderr,
+                "[wpe-backend-sdl] sync recv from UI: n=%zd (errno=%d)"
+                " — WP will create QCOM image in ensure_pbuffer\n", n, errno);
+    }
+
+    /* Always set up prism-fb as fallback.  Used if QCOM creation/setup fails
+     * in ensure_pbuffer.  UI also creates prism-fb unconditionally now, so it
+     * should already exist when we open it; create if absent. */
+    t->fb_size = (size_t)t->width * t->height * 4;
+    t->fb_fd   = open(PRISM_FB_PATH, O_RDWR);
     if (t->fb_fd < 0) {
-        perror("[wpe-backend-sdl] open prism-fb");
-    } else {
-        if (ftruncate(t->fb_fd, (off_t)t->fb_size) < 0)
-            perror("[wpe-backend-sdl] ftruncate prism-fb");
+        t->fb_fd = open(PRISM_FB_PATH, O_CREAT | O_RDWR, 0666);
+        if (t->fb_fd >= 0)
+            ftruncate(t->fb_fd, (off_t)t->fb_size);
+    }
+    if (t->fb_fd >= 0) {
         t->fb_pixels = mmap(NULL, t->fb_size,
                             PROT_READ | PROT_WRITE, MAP_SHARED,
                             t->fb_fd, 0);
         if (t->fb_pixels == MAP_FAILED) {
             perror("[wpe-backend-sdl] mmap prism-fb");
             t->fb_pixels = NULL;
+        } else {
+            fprintf(stderr,
+                    "[wpe-backend-sdl] prism-fb mapped: %zu bytes (fallback)\n",
+                    t->fb_size);
         }
-        fprintf(stderr, "[wpe-backend-sdl] prism-fb mapped: %zu bytes at %p\n",
-                t->fb_size, t->fb_pixels);
+    } else {
+        perror("[wpe-backend-sdl] open prism-fb");
     }
-    /* PBuffer is created lazily in frame_will_render once context is current. */
 }
 
 static EGLNativeWindowType
@@ -196,11 +223,22 @@ load_egl_extensions(struct sdl_target *t)
     t->pfn_UnlockSurface = (PFNEGLUNLOCKSURFACEKHRPROC)
         eglGetProcAddress("eglUnlockSurfaceKHR");
 
+    /* QCOM zero-copy: EGLImage import + GL_OES_EGL_image */
+    t->pfn_CreateImage = (PFNEGLCREATEIMAGEKHRPROC)
+        eglGetProcAddress("eglCreateImageKHR");
+    t->pfn_DestroyImage = (PFNEGLDESTROYIMAGEKHRPROC)
+        eglGetProcAddress("eglDestroyImageKHR");
+    t->pfn_ImageTargetTex = (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)
+        eglGetProcAddress("glEGLImageTargetTexture2DOES");
+
     fprintf(stderr,
-            "[wpe-backend-sdl] EGL exts: FenceSync=%s LockSurface=%s\n",
+            "[wpe-backend-sdl] EGL exts: FenceSync=%s LockSurface=%s"
+            " EGLImage=%s GL_OES_EGL_image=%s\n",
             (t->pfn_CreateSync && t->pfn_ClientWaitSync && t->pfn_DestroySync)
                 ? "YES" : "NO",
-            (t->pfn_LockSurface && t->pfn_UnlockSurface) ? "YES" : "NO");
+            (t->pfn_LockSurface && t->pfn_UnlockSurface) ? "YES" : "NO",
+            (t->pfn_CreateImage && t->pfn_DestroyImage) ? "YES" : "NO",
+            t->pfn_ImageTargetTex ? "YES" : "NO");
 }
 
 /* ── PBuffer creation (called once, when GL context is first current) ────── */
@@ -208,8 +246,50 @@ load_egl_extensions(struct sdl_target *t)
 static void
 ensure_pbuffer(struct sdl_target *t)
 {
-    if (t->pb_surf != EGL_NO_SURFACE)
-        return; /* already created */
+    if (t->pb_surf != EGL_NO_SURFACE) {
+        /*
+         * WPE may reuse this sdl_target struct across WebProcess respawns
+         * without calling renderer_target_destroy/create.  EGL handles from
+         * the dead process are meaningless in the new process — reset everything
+         * so we re-create the PBuffer below.
+         */
+        if (t->init_pid != (int)getpid()) {
+            fprintf(stderr,
+                    "[wpe-backend-sdl] ensure_pbuffer: new pid=%d (was %d)"
+                    " — resetting stale EGL state\n",
+                    (int)getpid(), t->init_pid);
+            /* Don't call eglDestroySurface — handle is invalid in this process */
+            t->pb_surf     = EGL_NO_SURFACE;
+            t->pb_dpy      = EGL_NO_DISPLAY;
+            t->pb_ctx      = EGL_NO_CONTEXT;
+            t->win_surf    = EGL_NO_SURFACE;
+            t->exts_loaded = 0;
+            t->has_lock    = 0;
+            /* Reset QCOM state — image handle invalid in new process */
+            t->qcom_ready        = 0;
+            t->qcom_ack_pending  = 0;
+            t->qcom_tex          = 0;
+            t->qcom_share_id     = 0;
+            t->qcom_created_image = EGL_NO_IMAGE_KHR;
+            t->pfn_CreateSharedImage_wp = NULL;
+            t->pfn_CreateImage   = NULL;
+            t->pfn_DestroyImage  = NULL;
+            t->pfn_ImageTargetTex = NULL;
+            t->pfn_CreateSync    = NULL;
+            t->pfn_ClientWaitSync = NULL;
+            t->pfn_DestroySync   = NULL;
+            t->pfn_LockSurface   = NULL;
+            t->pfn_UnlockSurface = NULL;
+            /* Close stale FIFO write end — will re-open below */
+            if (t->frame_fifo_fd >= 0) {
+                close(t->frame_fifo_fd);
+                t->frame_fifo_fd = -1;
+            }
+            /* init_pid will be set after successful PBuffer creation below */
+        } else {
+            return; /* already created in this process */
+        }
+    }
 
     EGLDisplay dpy = eglGetCurrentDisplay();
     EGLContext ctx = eglGetCurrentContext();
@@ -290,6 +370,92 @@ ensure_pbuffer(struct sdl_target *t)
         return;
     }
 
+    /* ── WP creates QCOM shared image (reversed from UI-creates approach) ───
+     * By creating on WP's own display (pb_dpy) with its real GL context,
+     * we avoid the cross-process EGL handle mismatch: UI's sdl_egl_dpy
+     * (e.g. 0x2) is not a valid display in WP's process space, so import
+     * using it returned EGL_BAD_DISPLAY.  Creating here, then having UI
+     * import on its own valid display (0x2), should succeed.
+     *
+     * Must be done AFTER load_egl_extensions so pfn_* are resolved.
+     * Sends {share_id, dpy} packet to UI (over t->fd) so UI can import.
+     * If creation fails, sends {0, 0} → UI stays on prism-fb fallback.
+     */
+    t->pfn_CreateSharedImage_wp = (PFNEGLCREATESHAREDIMAGEQUALCOMMPROC)
+        eglGetProcAddress("eglCreateSharedImageQUALCOMM");
+    {
+        int qcom_ok = 0;
+        if (t->pfn_CreateSharedImage_wp && t->pfn_ImageTargetTex
+                && t->pfn_DestroyImage) {
+            const EGLint sz_attribs[] = {
+                EGL_HEIGHT, (EGLint)t->height,
+                EGL_WIDTH,  (EGLint)t->width,
+                EGL_NONE
+            };
+            eglGetError(); /* clear */
+            EGLImageKHR img = t->pfn_CreateSharedImage_wp(
+                t->pb_dpy, t->pb_ctx, NULL, sz_attribs);
+            fprintf(stderr,
+                    "[wpe-backend-sdl] eglCreateSharedImageQUALCOMM(WP)"
+                    " -> %p (egl_err=0x%x)\n",
+                    (void *)img, (unsigned)eglGetError());
+            if (img != EGL_NO_IMAGE_KHR) {
+                t->qcom_created_image = img;
+                t->qcom_share_id = (EGLint)(uintptr_t)img;
+                glGenTextures(1, &t->qcom_tex);
+                glBindTexture(GL_TEXTURE_2D, t->qcom_tex);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                glGetError(); /* clear any pending GL error */
+                t->pfn_ImageTargetTex(GL_TEXTURE_2D, (GLeglImageOES)img);
+                GLenum gl_err = glGetError();
+                if (gl_err == GL_NO_ERROR) {
+                    /* Don't set qcom_ready yet — wait for UI to confirm it
+                     * successfully imported the image (ACK in frame_rendered).
+                     * WP uses prism-fb until ACK=1 arrives. */
+                    qcom_ok = 1;
+                    t->qcom_ack_pending = 1;
+                    fprintf(stderr,
+                            "[wpe-backend-sdl] WP QCOM tex ready:"
+                            " share_id=0x%x tex=%u — awaiting UI ACK\n",
+                            (unsigned)t->qcom_share_id, t->qcom_tex);
+                } else {
+                    fprintf(stderr,
+                            "[wpe-backend-sdl] glEGLImageTargetTexture2DOES"
+                            " on created image failed: 0x%x\n",
+                            (unsigned)gl_err);
+                    glDeleteTextures(1, &t->qcom_tex);
+                    t->qcom_tex = 0;
+                    t->pfn_DestroyImage(t->pb_dpy, img);
+                    t->qcom_created_image = EGL_NO_IMAGE_KHR;
+                    t->qcom_share_id = 0;
+                }
+            } else {
+                fprintf(stderr,
+                        "[wpe-backend-sdl] eglCreateSharedImageQUALCOMM"
+                        " failed\n");
+            }
+        } else {
+            fprintf(stderr,
+                    "[wpe-backend-sdl] QCOM exts not available:"
+                    " CreateSharedImage=%s ImageTargetTex=%s\n",
+                    t->pfn_CreateSharedImage_wp ? "YES" : "NO",
+                    t->pfn_ImageTargetTex       ? "YES" : "NO");
+        }
+        /* Inform UI: {share_id, dpy} or {0, 0} */
+        EGLint pkt[2] = {
+            qcom_ok ? t->qcom_share_id : 0,
+            qcom_ok ? (EGLint)(uintptr_t)t->pb_dpy : 0
+        };
+        ssize_t sent = write(t->fd, pkt, sizeof(pkt));
+        fprintf(stderr,
+                "[wpe-backend-sdl] QCOM init sent to UI:"
+                " share_id=0x%x dpy=0x%x (%zd bytes)\n",
+                (unsigned)pkt[0], (unsigned)pkt[1], sent);
+    }
+
     const EGLint pb_attrs[] = {
         EGL_WIDTH,  (EGLint)t->width,
         EGL_HEIGHT, (EGLint)t->height,
@@ -302,9 +468,25 @@ ensure_pbuffer(struct sdl_target *t)
                 (unsigned)eglGetError());
         return;
     }
+    t->init_pid = (int)getpid();
     fprintf(stderr,
-            "[wpe-backend-sdl] PBuffer surface created: %p (%ux%u) has_lock=%d\n",
-            (void *)t->pb_surf, t->width, t->height, t->has_lock);
+            "[wpe-backend-sdl] PBuffer surface created: %p (%ux%u) has_lock=%d pid=%d\n",
+            (void *)t->pb_surf, t->width, t->height, t->has_lock, t->init_pid);
+
+    /* Open the frame-signal FIFO (write end).  UI created it O_RDONLY already.
+     * O_NONBLOCK: don't block if UI hasn't opened yet (graceful degradation). */
+    if (t->frame_fifo_fd < 0) {
+        t->frame_fifo_fd = open(PRISM_FB_PATH "-frame.fifo",
+                                O_WRONLY | O_NONBLOCK);
+        if (t->frame_fifo_fd < 0)
+            fprintf(stderr,
+                    "[wpe-backend-sdl] frame-signal FIFO open failed: %s\n",
+                    strerror(errno));
+        else
+            fprintf(stderr,
+                    "[wpe-backend-sdl] frame-signal FIFO opened (write) fd=%d\n",
+                    t->frame_fifo_fd);
+    }
 }
 
 /* ── frame_will_render ───────────────────────────────────────────────────── */
@@ -319,7 +501,7 @@ renderer_target_frame_will_render(void *data)
     fprintf(stderr, "[wpe-backend-sdl] frame_will_render: ctx=%p surf=%p\n",
             (void *)ctx, (void *)surf);
 
-    /* Create PBuffer on first frame when EGL context is current */
+    /* Create PBuffer + QCOM shared image on first frame when EGL context is current */
     ensure_pbuffer(t);
 
     if (t->pb_surf == EGL_NO_SURFACE)
@@ -335,46 +517,68 @@ renderer_target_frame_will_render(void *data)
      * so it may produce an EGL_BAD_SURFACE error or simply present a blank
      * frame.  Either way we don't use the window surface for display.
      */
-    EGLBoolean ok = eglMakeCurrent(t->pb_dpy, t->pb_surf, t->pb_surf, t->pb_ctx);
-    fprintf(stderr,
-            "[wpe-backend-sdl] switched to PBuffer draw surface: %s (egl=0x%x)\n",
-            ok ? "OK" : "FAIL", ok ? 0 : (unsigned)eglGetError());
+    /* Guard: eglMakeCurrent with already-current ctx+surf hangs on this driver */
+    if (eglGetCurrentSurface(EGL_DRAW) != t->pb_surf) {
+        EGLBoolean ok = eglMakeCurrent(t->pb_dpy, t->pb_surf, t->pb_surf, t->pb_ctx);
+        fprintf(stderr,
+                "[wpe-backend-sdl] switched to PBuffer draw surface: %s (egl=0x%x)\n",
+                ok ? "OK" : "FAIL", ok ? 0 : (unsigned)eglGetError());
+    }
 }
 
 /* ── frame_rendered ─────────────────────────────────────────────────────── */
 
 /*
- * Pixel readback strategy:
+ * frame_rendered: two paths.
  *
- * Fast path (EGL_KHR_lock_surface available on PBuffer config):
- *   1. Insert an EGL fence sync — tells the GPU to signal when it finishes
- *      writing the PBuffer.  eglClientWaitSyncKHR blocks until the signal
- *      arrives, so we know the PBuffer pixels are stable before we touch them.
- *   2. eglLockSurfaceKHR — the driver maps the PBuffer's colour buffer directly
- *      into CPU address space.  No GL pipeline involvement, no format
- *      conversion, no redundant copy.
- *   3. One memcpy (or row-by-row if there is stride padding) into the shm.
- *   4. eglUnlockSurfaceKHR.
+ * Zero-copy path (EGL_QUALCOMM_shared_image, preferred):
+ *   WebKit has rendered into the PBuffer (FBO 0).  We GPU-blit those pixels
+ *   into the QCOM shared image via glCopyTexSubImage2D:
+ *     1. GPU fence sync — wait for WebKit's rendering to finish.
+ *     2. Bind the QCOM-backed texture.
+ *     3. glCopyTexSubImage2D — reads from current read framebuffer (PBuffer)
+ *        and writes directly into the QCOM shared image texture.  Pure GPU
+ *        operation: no CPU access, no system-memory bus crossing.
+ *     4. glFinish() — ensures all GPU writes are committed before signalling.
+ *   CPU is completely out of the pixel path.
  *
- * Fallback path (glReadPixels):
- *   Used when EGL_LOCK_SURFACE_BIT_KHR was not set on the PBuffer config, or
- *   when the lock surface extension functions are unavailable.  glReadPixels
- *   implicitly stalls the GPU pipeline and triggers an internal format
- *   conversion — kept purely as a safety net.
+ * Fallback path (EGL lock surface → mmap, or glReadPixels → mmap):
+ *   Used when QCOM shared image is unavailable (qcom_share_id == 0).
+ *   Involves CPU memcpy through system memory — kept as a safety net.
  */
 static void
 renderer_target_frame_rendered(void *data)
 {
     struct sdl_target *t = data;
 
-    if (t->pb_surf == EGL_NO_SURFACE || !t->fb_pixels)
+    /* ── Check for UI's QCOM import ACK ───────────────────────────────────
+     * UI sends 4 bytes (0x00000001 = QCOM OK, 0x00000000 = fallback) once,
+     * after it attempts eglCreateImageKHR import in on_sdl_poll.
+     * Until ACK arrives, qcom_ready stays 0 → we use prism-fb, guaranteeing
+     * the page renders.  Once ACK=1, we switch to GPU-only QCOM path.
+     */
+    if (t->qcom_ack_pending) {
+        EGLint ack = 0;
+        ssize_t n = recv(t->fd, &ack, sizeof(ack), MSG_DONTWAIT);
+        if (n == (ssize_t)sizeof(ack)) {
+            t->qcom_ack_pending = 0;
+            t->qcom_ready = (ack == 1) ? 1 : 0;
+            fprintf(stderr,
+                    "[wpe-backend-sdl] QCOM ACK from UI: %s\n",
+                    t->qcom_ready ? "QCOM OK — zero-copy active"
+                                  : "fallback — staying on prism-fb");
+        }
+        /* No ACK yet: qcom_ready stays 0, frame uses prism-fb */
+    }
+
+    if (t->pb_surf == EGL_NO_SURFACE)
         goto signal;
 
     /* Ensure PBuffer is the current draw/read surface */
     if (eglGetCurrentSurface(EGL_DRAW) != t->pb_surf)
         eglMakeCurrent(t->pb_dpy, t->pb_surf, t->pb_surf, t->pb_ctx);
 
-    /* ── Step 1: GPU fence — wait for rendering into PBuffer to finish ── */
+    /* ── Step 1: GPU fence — wait for WebKit's rendering to finish ── */
     if (t->pfn_CreateSync && t->pfn_ClientWaitSync && t->pfn_DestroySync) {
         EGLSyncKHR fence = t->pfn_CreateSync(t->pb_dpy, EGL_SYNC_FENCE_KHR, NULL);
         if (fence != EGL_NO_SYNC_KHR) {
@@ -389,104 +593,149 @@ renderer_target_frame_rendered(void *data)
     { GLenum e; while ((e = glGetError()) != GL_NO_ERROR)
           fprintf(stderr, "[wpe-backend-sdl] GL err drained: 0x%x\n", e); }
 
-    if (t->has_lock && t->pfn_LockSurface && t->pfn_UnlockSurface) {
-        /* ── Fast path: EGL lock surface ── */
-        static const EGLint lock_attrs[] = {
-            EGL_LOCK_USAGE_HINT_KHR, EGL_READ_SURFACE_BIT_KHR,
-            EGL_NONE
-        };
-        if (t->pfn_LockSurface(t->pb_dpy, t->pb_surf, lock_attrs)) {
-            EGLint bitmap_ptr_raw = 0, bitmap_pitch = 0;
-            EGLint origin = EGL_UPPER_LEFT_KHR; /* safe default */
-            eglQuerySurface(t->pb_dpy, t->pb_surf,
-                            EGL_BITMAP_POINTER_KHR, &bitmap_ptr_raw);
-            eglQuerySurface(t->pb_dpy, t->pb_surf,
-                            EGL_BITMAP_PITCH_KHR,   &bitmap_pitch);
-            eglQuerySurface(t->pb_dpy, t->pb_surf,
-                            EGL_BITMAP_ORIGIN_KHR,  &origin);
+    if (t->qcom_ready) {
+        /* ── Zero-copy path: GPU blit PBuffer → QCOM shared image ── */
+        glBindTexture(GL_TEXTURE_2D, t->qcom_tex);
 
-            const uint8_t *src = (const uint8_t *)(uintptr_t)(uint32_t)bitmap_ptr_raw;
-            uint8_t       *dst = (uint8_t *)t->fb_pixels;
-            size_t row_bytes   = (size_t)t->width * 4;
+        /*
+         * glCopyTexSubImage2D reads from the current read framebuffer
+         * (the PBuffer, FBO 0) and writes into the bound texture's image.
+         * Since qcom_tex is backed by the EGL_QUALCOMM_shared_image, this
+         * writes directly into the GPU buffer shared with the UI process.
+         * No CPU involvement — GPU-only transfer via internal memory.
+         *
+         * Per GL_OES_EGL_image spec: glCopyTexSubImage2D on an EGLImage-
+         * backed texture modifies the shared image's pixel data.
+         */
+        glCopyTexSubImage2D(GL_TEXTURE_2D, 0,
+                            0, 0,               /* xoffset, yoffset in dest */
+                            0, 0,               /* x, y in source FB       */
+                            (GLsizei)t->width,
+                            (GLsizei)t->height);
 
-            if (src) {
-                if (origin == EGL_UPPER_LEFT_KHR) {
-                    /*
-                     * Upper-left origin: bitmap row 0 = top of surface.
-                     * glReadPixels convention is lower-left (row 0 = bottom).
-                     * Flip rows so the shm layout matches what glReadPixels
-                     * would have produced — the UI compositor expects that.
-                     */
-                    const uint8_t *s = src + (size_t)(t->height - 1) * bitmap_pitch;
-                    for (uint32_t r = 0; r < t->height;
-                         r++, s -= bitmap_pitch, dst += row_bytes)
-                        memcpy(dst, s, row_bytes);
-                } else {
-                    /*
-                     * EGL_LOWER_LEFT_KHR: rows are in the same bottom-up
-                     * order as glReadPixels — straight copy.
-                     */
-                    if ((size_t)bitmap_pitch == row_bytes) {
-                        memcpy(dst, src, t->fb_size);
-                    } else {
-                        const uint8_t *s = src;
+        GLenum gl_err = glGetError();
+        static int qcom_logged = 0;
+        if (!qcom_logged) {
+            qcom_logged = 1;
+            fprintf(stderr,
+                    "[wpe-backend-sdl] QCOM GPU blit OK (err=0x%x):"
+                    " %ux%u → shared image\n",
+                    (unsigned)gl_err, t->width, t->height);
+            if (gl_err != GL_NO_ERROR) {
+                fprintf(stderr,
+                        "[wpe-backend-sdl] glCopyTexSubImage2D failed:"
+                        " falling back to prism-fb\n");
+                t->qcom_ready = 0;
+                goto fallback_readback;
+            }
+        } else if (gl_err != GL_NO_ERROR) {
+            t->qcom_ready = 0;
+            goto fallback_readback;
+        }
+
+        /*
+         * glFinish ensures all GPU writes are committed to the shared image
+         * before we signal the UI process.  Since both processes share the
+         * same GPU command queue, the UI process's subsequent GL commands
+         * that read from the shared image will see the updated data.
+         */
+        glFinish();
+
+    } else {
+fallback_readback:
+        if (!t->fb_pixels)
+            goto restore;
+
+        if (t->has_lock && t->pfn_LockSurface && t->pfn_UnlockSurface) {
+            /* ── Fast fallback: EGL lock surface ── */
+            static const EGLint lock_attrs[] = {
+                EGL_LOCK_USAGE_HINT_KHR, EGL_READ_SURFACE_BIT_KHR,
+                EGL_NONE
+            };
+            if (t->pfn_LockSurface(t->pb_dpy, t->pb_surf, lock_attrs)) {
+                EGLint bitmap_ptr_raw = 0, bitmap_pitch = 0;
+                EGLint origin = EGL_UPPER_LEFT_KHR;
+                eglQuerySurface(t->pb_dpy, t->pb_surf,
+                                EGL_BITMAP_POINTER_KHR, &bitmap_ptr_raw);
+                eglQuerySurface(t->pb_dpy, t->pb_surf,
+                                EGL_BITMAP_PITCH_KHR,   &bitmap_pitch);
+                eglQuerySurface(t->pb_dpy, t->pb_surf,
+                                EGL_BITMAP_ORIGIN_KHR,  &origin);
+
+                const uint8_t *src = (const uint8_t *)(uintptr_t)(uint32_t)bitmap_ptr_raw;
+                uint8_t       *dst = (uint8_t *)t->fb_pixels;
+                size_t row_bytes   = (size_t)t->width * 4;
+
+                if (src) {
+                    if (origin == EGL_UPPER_LEFT_KHR) {
+                        const uint8_t *s = src + (size_t)(t->height-1)*bitmap_pitch;
                         for (uint32_t r = 0; r < t->height;
-                             r++, s += bitmap_pitch, dst += row_bytes)
+                             r++, s -= bitmap_pitch, dst += row_bytes)
                             memcpy(dst, s, row_bytes);
+                    } else {
+                        if ((size_t)bitmap_pitch == row_bytes) {
+                            memcpy(dst, src, t->fb_size);
+                        } else {
+                            const uint8_t *s = src;
+                            for (uint32_t r = 0; r < t->height;
+                                 r++, s += bitmap_pitch, dst += row_bytes)
+                                memcpy(dst, s, row_bytes);
+                        }
+                    }
+                    static int lock_logged = 0;
+                    if (!lock_logged) {
+                        lock_logged = 1;
+                        fprintf(stderr,
+                                "[wpe-backend-sdl] lock readback OK:"
+                                " origin=%s pitch=%d\n",
+                                origin == EGL_LOWER_LEFT_KHR
+                                    ? "lower-left" : "upper-left",
+                                bitmap_pitch);
                     }
                 }
-
-                /* First-frame diagnostic */
-                static int lock_logged = 0;
-                if (!lock_logged) {
-                    lock_logged = 1;
-                    const uint8_t *px = (const uint8_t *)t->fb_pixels
-                        + ((t->height/2) * t->width + (t->width/2)) * 4;
-                    fprintf(stderr,
-                            "[wpe-backend-sdl] lock readback OK:"
-                            " origin=%s pitch=%d center=(%d,%d,%d,%d)\n",
-                            origin == EGL_LOWER_LEFT_KHR ? "lower-left" : "upper-left",
-                            bitmap_pitch, px[0], px[1], px[2], px[3]);
-                }
+                t->pfn_UnlockSurface(t->pb_dpy, t->pb_surf);
+            } else {
+                fprintf(stderr,
+                        "[wpe-backend-sdl] eglLockSurface failed (0x%x),"
+                        " falling back to glReadPixels\n",
+                        (unsigned)eglGetError());
+                t->has_lock = 0;
+                goto readpixels;
             }
-
-            t->pfn_UnlockSurface(t->pb_dpy, t->pb_surf);
         } else {
-            fprintf(stderr,
-                    "[wpe-backend-sdl] eglLockSurface failed (0x%x),"
-                    " falling back to glReadPixels\n",
-                    (unsigned)eglGetError());
-            t->has_lock = 0; /* don't try again */
-            goto readpixels;
-        }
-    } else {
 readpixels:
-        /* ── Fallback: glReadPixels (stalls GPU pipeline) ── */
-        glReadPixels(0, 0, (GLsizei)t->width, (GLsizei)t->height,
-                     GL_RGBA, GL_UNSIGNED_BYTE, t->fb_pixels);
-        GLenum err = glGetError();
-        static int rp_logged = 0;
-        if (!rp_logged) {
-            rp_logged = 1;
-            const uint8_t *px = (const uint8_t *)t->fb_pixels
-                + ((t->height/2) * t->width + (t->width/2)) * 4;
-            fprintf(stderr,
-                    "[wpe-backend-sdl] glReadPixels fallback:"
-                    " center=(%d,%d,%d,%d) err=0x%x\n",
-                    px[0], px[1], px[2], px[3], (unsigned)err);
+            glReadPixels(0, 0, (GLsizei)t->width, (GLsizei)t->height,
+                         GL_RGBA, GL_UNSIGNED_BYTE, t->fb_pixels);
+            static int rp_logged = 0;
+            if (!rp_logged) {
+                rp_logged = 1;
+                fprintf(stderr, "[wpe-backend-sdl] glReadPixels fallback\n");
+            }
         }
     }
 
-    /* Restore window surface so WPE's next eglSwapBuffers works */
-    if (t->win_surf != EGL_NO_SURFACE)
-        eglMakeCurrent(t->pb_dpy, t->win_surf, t->win_surf, t->pb_ctx);
+restore:
+    /*
+     * Do NOT restore win_surf here.  WPE calls eglSwapBuffers after
+     * frame_rendered — if win_surf is current, that swap presents a blank
+     * PDK fullscreen surface and SysMgr hands display ownership to
+     * WPEWebProcess, overwriting SDL's composited output.  For static pages
+     * (info.cern.ch) SDL recovers quickly; for live pages (google.com) WP
+     * keeps swapping and the display never shows SDL's frame.
+     *
+     * Keeping pb_surf current means WPE's eglSwapBuffers hits the PBuffer —
+     * a no-op for display output.  frame_will_render already guards against
+     * redundant eglMakeCurrent (checks pb_surf == current before calling).
+     */
 
 signal:
     wpe_renderer_backend_egl_target_dispatch_frame_complete(t->wpe_target);
 
-    if (t->fd >= 0) {
+    /* Signal UI via FIFO — works across all WebProcesses regardless of IPC fd.
+     * t->fd is EBADF for second+ WebProcesses so we don't use it for signals. */
+    if (t->frame_fifo_fd >= 0) {
         const char sig = 'F';
-        write(t->fd, &sig, 1);
+        write(t->frame_fifo_fd, &sig, 1);
     }
 }
 

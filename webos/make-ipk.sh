@@ -191,6 +191,7 @@ SHIP_LIBS=(
     "libgstsdp-1.0.so.0.1806.0"
     # FFmpeg 6.1 — provides AAC/MP3/Vorbis/H.264 software decode via gst-libav
     "libavcodec.so.60.31.102"
+    "libavfilter.so.9.12.100"
     "libavformat.so.60.16.100"
     "libavutil.so.58.29.100"
     "libswresample.so.4.12.100"

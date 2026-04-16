@@ -21,7 +21,7 @@
 #include <wpe/wpe.h>
 
 #define PRISM_DATA_DIR      "/media/internal/prism/data"
-#define PRISM_CACHE_DIR     "/tmp/prism-cache"    /* tmpfs: supports hard links */
+#define PRISM_CACHE_DIR     "/media/internal/prism/cache"
 #define PRISM_COOKIE_DB     "/media/internal/prism/cookies.sqlite"
 #define PRISM_DOWNLOAD_DIR  "/media/internal/downloads"
 
@@ -567,6 +567,14 @@ static void on_progress_changed(WebKitWebView *view, GParamSpec *pspec, gpointer
 
 int main(int argc, char **argv)
 {
+    /* Redirect TMPDIR and GST temp files to /media/internal which has ~25GB
+     * free. The default /tmp tmpfs is only 40MB — way too small for a browser
+     * download buffer or WebKit's disk cache. */
+    mkdir("/media/internal/prism",     0755);
+    mkdir("/media/internal/prism/tmp", 0755);
+    setenv("TMPDIR",     "/media/internal/prism/tmp", 1);
+    setenv("GST_TMPDIR", "/media/internal/prism/tmp", 1);
+
     const char *url = argc > 1 ? argv[1]
         : "file:///usr/palm/applications/com.prism.browser/home.html";
     fprintf(stderr, "[prism] starting, url=%s\n", url);

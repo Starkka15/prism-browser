@@ -270,7 +270,8 @@ struct _GstPalmVideoDec {
 
     /* Port-reconfigure event */
     gboolean         port_reconfig;
-    gboolean         port_cmd_complete; /* set by EventHandler on PortDisable/Enable done */
+    gboolean         port_cmd_complete;    /* set by EventHandler on PortDisable CmdComplete */
+    gboolean         port_enable_complete; /* set by EventHandler on PortEnable CmdComplete */
     pthread_mutex_t  reconfig_lock;
     pthread_cond_t   reconfig_cond;
 
@@ -283,6 +284,9 @@ struct _GstPalmVideoDec {
     gint             out_width;
     gint             out_height;
     guint            out_buf_size;
+    guint            out_stride;       /* OMX hardware-aligned row stride (bytes) */
+    guint            out_slice_height; /* OMX hardware-aligned frame height       */
+    gint             stride_probed;    /* counts one-time stride probe dumps      */
 
     /* Dynamic library handle for libOmxCore.so */
     void            *omxcore_dl;
@@ -303,6 +307,20 @@ struct _GstPalmVideoDec {
     guint8          *codec_config;
     guint            codec_config_len;
     gboolean         codec_config_sent;
+
+    /* Component name (e.g. "OMX.qcom.video.decoder.avc") saved for full reset */
+    char             comp_name[64];
+
+    /* After a full FreeHandle+GetHandle reset the fresh component will fire
+     * PortSettingsChanged when it reads the SPS we re-send.  We cannot do
+     * another full reset (would loop forever).  Instead, do a lightweight
+     * PortDisable+drain+PortEnable without FreeBuffer/AllocateBuffer. */
+    gboolean         light_reconfig;
+
+    /* Set by do_port_reconfig when the full reset completes with new dims.
+     * handle_frame reads and clears this to call gst_video_decoder_set_output_state
+     * with the corrected dimensions (while holding the stream lock). */
+    gboolean         need_output_state_update;
 };
 
 struct _GstPalmVideoDecClass {

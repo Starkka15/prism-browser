@@ -14,6 +14,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
 #include <dlfcn.h>
 #include <time.h>
 #include "gstpalmvideodec.h"
@@ -187,7 +188,8 @@ static OMX_ERRORTYPE omx_event_handler(OMX_HANDLETYPE hComp, OMX_PTR pAppData,
         } else if (nData1 == (OMX_U32)OMX_CommandPortEnable) {
             GST_DEBUG_OBJECT(self, "OMX port enable complete port=%d", (int)nData2);
             pthread_mutex_lock(&self->reconfig_lock);
-            self->port_cmd_complete = TRUE;
+            self->port_cmd_complete    = TRUE;
+            self->port_enable_complete = TRUE;
             pthread_cond_broadcast(&self->reconfig_cond);
             pthread_mutex_unlock(&self->reconfig_lock);
         }
@@ -204,6 +206,14 @@ static OMX_ERRORTYPE omx_event_handler(OMX_HANDLETYPE hComp, OMX_PTR pAppData,
         GST_DEBUG_OBJECT(self, "OMX port reconfig port=%d", (int)nData1);
         fprintf(stderr, "[palmvideodec] PortSettingsChanged port=%d\n", (int)nData1);
         pthread_mutex_lock(&self->reconfig_lock);
+        /* light_reconfig is armed after a full reset to signal that the
+         * next PortSettingsChanged must be handled WITHOUT another
+         * FreeHandle+GetHandle (which would loop forever). */
+        if (self->light_reconfig) {
+            fprintf(stderr,
+                "[palmvideodec] PortSettingsChanged: post-reset → light reconfig path\n");
+            /* light_reconfig flag stays TRUE — do_port_reconfig reads it */
+        }
         self->port_reconfig = TRUE;
         pthread_cond_broadcast(&self->reconfig_cond);
         pthread_mutex_unlock(&self->reconfig_lock);
@@ -221,7 +231,7 @@ static OMX_ERRORTYPE omx_empty_buffer_done(OMX_HANDLETYPE hComp,
 {
     GstPalmVideoDec *self = GST_PALM_VIDEO_DEC(pAppData);
     (void)hComp;
-    GST_LOG_OBJECT(self, "EmptyBufferDone buf=%p", (void*)pBuf);
+    GST_INFO_OBJECT(self, "EmptyBufferDone buf=%p", (void*)pBuf);
     /* Return input buffer to free pool */
     g_async_queue_push(self->in_queue, pBuf);
     return OMX_ErrorNone;
@@ -233,7 +243,7 @@ static OMX_ERRORTYPE omx_fill_buffer_done(OMX_HANDLETYPE hComp,
 {
     GstPalmVideoDec *self = GST_PALM_VIDEO_DEC(pAppData);
     (void)hComp;
-    GST_LOG_OBJECT(self, "FillBufferDone buf=%p filled=%d flags=0x%x",
+    GST_INFO_OBJECT(self, "FillBufferDone buf=%p filled=%d flags=0x%x",
                    (void*)pBuf, (int)pBuf->nFilledLen, (unsigned)pBuf->nFlags);
     /* Push filled output buffer to output queue */
     g_async_queue_push(self->out_queue, pBuf);
@@ -242,14 +252,243 @@ static OMX_ERRORTYPE omx_fill_buffer_done(OMX_HANDLETYPE hComp,
 
 /* ── OMX IL port reconfiguration sequence ───────────────────────────────── */
 /* Called from output thread when OMX_EventPortSettingsChanged fires.
- * Performs: PortDisable → FreeBuffer(all out) → GetParameter → PortEnable
- *           → AllocateBuffer(all out) → FillThisBuffer(all). */
+ *
+ * Per OMX IL spec, the correct order is:
+ *   1. SendCommand(PortDisable)
+ *   2. Wait for PortDisable CmdComplete  ← component returns all buffers FIRST
+ *   3. FreeBuffer for all returned output buffers
+ *   4. SendCommand(PortEnable)
+ *   5. AllocateBuffer (same count & size)
+ *   6. Wait for PortEnable CmdComplete
+ *   7. FillThisBuffer for all new output buffers
+ *
+ * Previous attempts failed because FreeBuffer was called BEFORE PortDisable
+ * CmdComplete, which freed in-flight buffers and triggered OMX_ErrorHardware. */
+/* do_port_reconfig — full component reset on PortSettingsChanged.
+ *
+ * Qualcomm APQ8060 OMX quirk: AllocateBuffer always fails (0x80001000) after
+ * FreeBuffer because pmem_adsp is held at the component level until the
+ * component instance is destroyed.  PortEnable + AllocateBuffer therefore
+ * never works.  Instead, after PortDisable + FreeBuffer, we destroy the old
+ * component (FreeHandle) and create a fresh one (GetHandle), which gets a
+ * clean pmem pool. */
 static void do_port_reconfig(GstPalmVideoDec *self)
 {
     OMX_ERRORTYPE err;
-    struct timespec ts;
 
-    GST_DEBUG_OBJECT(self, "port reconfig: start");
+    /* ── Check for light-reconfig path (post full-reset PortSettingsChanged) ──
+     *
+     * After FreeHandle+GetHandle, the fresh component fires PortSettingsChanged
+     * when it reads SPS.  We cannot do another full reset (that would loop).
+     * Instead: PortDisable → drain output buffers (NO FreeBuffer) → PortEnable
+     * → FillThisBuffer.  The component retains its AllocateBuffer'd buffers
+     * throughout, so no AllocateBuffer is needed.
+     *
+     * Also flush PORT_IN to recover the stuck input SPS buffer. */
+    pthread_mutex_lock(&self->reconfig_lock);
+    gboolean do_light = self->light_reconfig;
+    pthread_mutex_unlock(&self->reconfig_lock);
+
+    if (do_light) {
+        GST_INFO_OBJECT(self, "light reconfig: start (post-reset PortSettingsChanged)");
+
+        /* Qualcomm APQ8060 OMX behaviour on post-reset PortSettingsChanged:
+         *
+         * PortDisable CmdComplete requires FreeBuffer calls — without them the
+         * component never fires CmdComplete and the port stays locked.
+         * (Confirmed: full-reset path fires CmdComplete mid-FreeBuffer sequence.)
+         *
+         * Correct OMX IL sequence for PORT_OUT PortSettingsChanged:
+         *   L1.  Clear flags; send PortDisable PORT_OUT
+         *   L2.  Drain out_queue (component returns bufs via FillBufferDone)
+         *   L3.  FreeBuffer all returned bufs → triggers PortDisable CmdComplete
+         *   L4.  Wait for PortDisable CmdComplete (port_cmd_complete)
+         *   L5.  Clear port_enable_complete; send PortEnable PORT_OUT
+         *   L6.  AllocateBuffer × n_out_bufs → populates port → PortEnable CmdComplete
+         *   L7.  Wait for PortEnable CmdComplete (port_enable_complete)
+         *   L8.  Flush PORT_IN to recover stuck SPS input buffer
+         *   L9.  FillThisBuffer all new output buffers
+         *   L10. Reset codec_config_sent (IN port flushed, re-send SPS)
+         *   L11. Clear flags, broadcast reconfig_cond                          */
+
+        /* ── L1. Clear flags + PortDisable ── */
+        pthread_mutex_lock(&self->reconfig_lock);
+        self->port_cmd_complete    = FALSE;
+        self->port_enable_complete = FALSE;
+        pthread_mutex_unlock(&self->reconfig_lock);
+
+        err = OMX_SendCommand(self->omx_handle, OMX_CommandPortDisable, PALM_VD_PORT_OUT, NULL);
+        GST_DEBUG_OBJECT(self, "light reconfig: PortDisable err=0x%x", (unsigned)err);
+
+        /* ── L2. Drain output buffers (component returns them via FillBufferDone) ── */
+        OMX_BUFFERHEADERTYPE *returned_bufs[PALM_VD_N_OUT_BUFS];
+        guint n_returned = 0;
+        {
+            gint64 dl = g_get_monotonic_time() + 5 * G_USEC_PER_SEC;
+            while (n_returned < self->n_out_bufs && g_get_monotonic_time() < dl) {
+                OMX_BUFFERHEADERTYPE *b =
+                    g_async_queue_timeout_pop(self->out_queue, 20000 /* 20ms */);
+                if (b) returned_bufs[n_returned++] = b;
+            }
+            OMX_BUFFERHEADERTYPE *b;
+            while ((b = g_async_queue_try_pop(self->out_queue)) != NULL) {
+                if (n_returned < PALM_VD_N_OUT_BUFS) returned_bufs[n_returned++] = b;
+            }
+        }
+        GST_INFO_OBJECT(self, "light reconfig: drained %d/%d output bufs", n_returned, self->n_out_bufs);
+
+        /* ── L3. FreeBuffer all returned bufs → triggers PortDisable CmdComplete ── */
+        for (guint i = 0; i < n_returned; i++) {
+            OMX_ERRORTYPE ferr = OMX_FreeBuffer(self->omx_handle, PALM_VD_PORT_OUT, returned_bufs[i]);
+            GST_DEBUG_OBJECT(self, "light reconfig: FreeBuffer[%d] err=0x%x", i, (unsigned)ferr);
+            self->out_bufs[i] = NULL;
+        }
+        if (n_returned < self->n_out_bufs) {
+            GST_WARNING_OBJECT(self,
+                "light reconfig: only %d/%d bufs returned before FreeBuffer",
+                n_returned, self->n_out_bufs);
+        }
+
+        /* ── L4. Wait for PortDisable CmdComplete ── */
+        {
+            gint64 dl = g_get_monotonic_time() + 3 * G_USEC_PER_SEC;
+            for (;;) {
+                pthread_mutex_lock(&self->reconfig_lock);
+                gboolean done = self->port_cmd_complete;
+                pthread_mutex_unlock(&self->reconfig_lock);
+                if (done) break;
+                if (g_get_monotonic_time() > dl) {
+                    GST_WARNING_OBJECT(self, "light reconfig: PortDisable CmdComplete timeout");
+                    break;
+                }
+                g_usleep(10000);
+            }
+            GST_INFO_OBJECT(self, "light reconfig: PortDisable CmdComplete done");
+        }
+
+        /* ── L5. PortEnable PORT_OUT ── */
+        pthread_mutex_lock(&self->reconfig_lock);
+        self->port_enable_complete = FALSE;
+        pthread_mutex_unlock(&self->reconfig_lock);
+
+        err = OMX_SendCommand(self->omx_handle, OMX_CommandPortEnable, PALM_VD_PORT_OUT, NULL);
+        GST_DEBUG_OBJECT(self, "light reconfig: PortEnable err=0x%x", (unsigned)err);
+
+        /* ── L6. AllocateBuffer × n_out_bufs → populates port → PortEnable CmdComplete ──
+         * Per OMX IL spec: AllocateBuffer during PortEnable populates the port;
+         * PortEnable CmdComplete fires when all buffers are allocated. */
+        {
+            OMX_PARAM_PORTDEFINITIONTYPE pd_out;
+            port_def_init(&pd_out);
+            pd_out.nPortIndex = PALM_VD_PORT_OUT;
+            OMX_GetParameter(self->omx_handle, OMX_IndexParamPortDefinition, &pd_out);
+            guint n_new = pd_out.nBufferCountActual ? pd_out.nBufferCountActual : self->n_out_bufs;
+            guint sz    = pd_out.nBufferSize         ? pd_out.nBufferSize         : self->out_buf_size;
+            /* Update stride/slice_height from new port definition */
+            if (pd_out.format.video.nStride)
+                self->out_stride       = pd_out.format.video.nStride;
+            if (pd_out.format.video.nSliceHeight)
+                self->out_slice_height = pd_out.format.video.nSliceHeight;
+            GST_INFO_OBJECT(self, "light reconfig: out port n=%u size=%u stride=%u slice_h=%u",
+                            n_new, sz, self->out_stride, self->out_slice_height);
+
+            guint n_alloc = 0;
+            for (guint i = 0; i < n_new && i < PALM_VD_N_OUT_BUFS; i++) {
+                OMX_BUFFERHEADERTYPE *hdr = NULL;
+                OMX_ERRORTYPE aerr = OMX_AllocateBuffer(self->omx_handle, &hdr,
+                                                        PALM_VD_PORT_OUT, self, sz);
+                GST_DEBUG_OBJECT(self, "light reconfig: AllocateBuffer out[%d] err=0x%x",
+                                 i, (unsigned)aerr);
+                if (aerr == OMX_ErrorNone && hdr) {
+                    self->out_bufs[i] = hdr;
+                    n_alloc++;
+                }
+            }
+            self->n_out_bufs  = n_alloc;
+            self->out_buf_size = sz;
+            GST_INFO_OBJECT(self, "light reconfig: allocated %d/%d output bufs", n_alloc, n_new);
+
+            if (n_alloc == 0) {
+                GST_ERROR_OBJECT(self,
+                    "light reconfig: AllocateBuffer failed for all output bufs — cannot recover");
+                pthread_mutex_lock(&self->reconfig_lock);
+                self->light_reconfig = FALSE;
+                self->port_reconfig  = FALSE;
+                pthread_cond_broadcast(&self->reconfig_cond);
+                pthread_mutex_unlock(&self->reconfig_lock);
+                return;
+            }
+        }
+
+        /* ── L7. Wait for PortEnable CmdComplete ── */
+        {
+            gint64 dl = g_get_monotonic_time() + 3 * G_USEC_PER_SEC;
+            for (;;) {
+                pthread_mutex_lock(&self->reconfig_lock);
+                gboolean done = self->port_enable_complete;
+                pthread_mutex_unlock(&self->reconfig_lock);
+                if (done) break;
+                if (g_get_monotonic_time() > dl) {
+                    GST_WARNING_OBJECT(self, "light reconfig: PortEnable CmdComplete timeout");
+                    break;
+                }
+                g_usleep(10000);
+            }
+            GST_INFO_OBJECT(self, "light reconfig: PortEnable CmdComplete done");
+        }
+
+        /* ── L8. Flush PORT_IN to recover stuck SPS input buffer ── */
+        OMX_SendCommand(self->omx_handle, OMX_CommandFlush, PALM_VD_PORT_IN, NULL);
+        g_usleep(80000);
+
+        /* ── L9. FillThisBuffer all new output buffers ── */
+        guint fill_count = 0;
+        for (guint i = 0; i < self->n_out_bufs; i++) {
+            err = OMX_FillThisBuffer(self->omx_handle, self->out_bufs[i]);
+            GST_DEBUG_OBJECT(self, "light reconfig: FillThisBuffer[%d] err=0x%x",
+                             i, (unsigned)err);
+            if (err == OMX_ErrorNone) fill_count++;
+        }
+
+        /* ── L10. Force SPS re-send (IN port flushed, component needs SPS again) ── */
+        self->codec_config_sent = FALSE;
+
+        /* ── L11. Clear flags ── */
+        pthread_mutex_lock(&self->reconfig_lock);
+        self->light_reconfig       = FALSE;
+        self->port_reconfig        = FALSE;
+        self->port_cmd_complete    = FALSE;
+        self->port_enable_complete = FALSE;
+        pthread_cond_broadcast(&self->reconfig_cond);
+        pthread_mutex_unlock(&self->reconfig_lock);
+
+        GST_INFO_OBJECT(self, "light reconfig: complete — %d bufs resubmitted", fill_count);
+        return;
+    }
+
+    GST_DEBUG_OBJECT(self, "port reconfig: start (full reset)");
+
+    /* ── 0. Save actual output geometry from CURRENT component before destroy.
+     *
+     * After PortSettingsChanged, the component has parsed SPS and knows the
+     * real output dimensions.  Read them NOW so we can configure the fresh
+     * component identically — if we wait until after GetHandle, we only get
+     * hardware defaults (1920×1088) which cause another PortSettingsChanged. ── */
+    {
+        OMX_PARAM_PORTDEFINITIONTYPE pd_pre;
+        port_def_init(&pd_pre);
+        pd_pre.nPortIndex = PALM_VD_PORT_OUT;
+        if (OMX_GetParameter(self->omx_handle,
+                             OMX_IndexParamPortDefinition, &pd_pre) == OMX_ErrorNone
+            && pd_pre.format.video.nFrameWidth
+            && pd_pre.format.video.nFrameHeight) {
+            GST_DEBUG_OBJECT(self, "port reconfig: pre-destroy dims %dx%d",
+                             (int)pd_pre.format.video.nFrameWidth,
+                             (int)pd_pre.format.video.nFrameHeight);
+            self->out_width  = (gint)pd_pre.format.video.nFrameWidth;
+            self->out_height = (gint)pd_pre.format.video.nFrameHeight;
+        }
+    }
 
     /* ── 1. Disable output port ── */
     pthread_mutex_lock(&self->reconfig_lock);
@@ -259,76 +498,245 @@ static void do_port_reconfig(GstPalmVideoDec *self)
     err = OMX_SendCommand(self->omx_handle, OMX_CommandPortDisable, PALM_VD_PORT_OUT, NULL);
     GST_DEBUG_OBJECT(self, "port reconfig: PortDisable cmd err=0x%x", (unsigned)err);
 
-    /* ── 2. Free all output buffers (must happen while port is disabling) ── */
-    for (guint i = 0; i < self->n_out_bufs; i++) {
+    /* ── 2. Interleaved: drain FillBufferDone + FreeBuffer until CmdComplete ── */
+    {
+        gint64 deadline = g_get_monotonic_time() + 3 * G_USEC_PER_SEC;
+        pthread_mutex_lock(&self->reconfig_lock);
+        while (!self->port_cmd_complete) {
+            struct timespec ts20ms;
+            clock_gettime(CLOCK_REALTIME, &ts20ms);
+            ts20ms.tv_nsec += 20000000;
+            if (ts20ms.tv_nsec >= 1000000000) { ts20ms.tv_sec++; ts20ms.tv_nsec -= 1000000000; }
+            pthread_cond_timedwait(&self->reconfig_cond, &self->reconfig_lock, &ts20ms);
+            pthread_mutex_unlock(&self->reconfig_lock);
+
+            OMX_BUFFERHEADERTYPE *b;
+            while ((b = g_async_queue_try_pop(self->out_queue)) != NULL) {
+                for (guint i = 0; i < PALM_VD_N_OUT_BUFS; i++) {
+                    if (self->out_bufs[i] == b) {
+                        err = OMX_FreeBuffer(self->omx_handle, PALM_VD_PORT_OUT, b);
+                        GST_DEBUG_OBJECT(self, "port reconfig: FreeBuffer out[%d] err=0x%x", i, (unsigned)err);
+                        self->out_bufs[i] = NULL;
+                        if (self->n_out_bufs > 0) self->n_out_bufs--;
+                        break;
+                    }
+                }
+            }
+
+            if (g_get_monotonic_time() > deadline) {
+                GST_WARNING_OBJECT(self, "port reconfig: PortDisable timeout, force-freeing");
+                for (guint i = 0; i < PALM_VD_N_OUT_BUFS; i++) {
+                    if (self->out_bufs[i]) {
+                        OMX_FreeBuffer(self->omx_handle, PALM_VD_PORT_OUT, self->out_bufs[i]);
+                        self->out_bufs[i] = NULL;
+                    }
+                }
+                self->n_out_bufs = 0;
+                break;
+            }
+            pthread_mutex_lock(&self->reconfig_lock);
+        }
+        if (self->port_cmd_complete) {
+            self->port_cmd_complete = FALSE;
+            pthread_mutex_unlock(&self->reconfig_lock);
+        }
+    }
+    for (guint i = 0; i < PALM_VD_N_OUT_BUFS; i++) {
         if (self->out_bufs[i]) {
             OMX_FreeBuffer(self->omx_handle, PALM_VD_PORT_OUT, self->out_bufs[i]);
             self->out_bufs[i] = NULL;
         }
     }
     self->n_out_bufs = 0;
-
-    /* ── 3. Wait for PortDisable complete ── */
-    pthread_mutex_lock(&self->reconfig_lock);
-    clock_gettime(CLOCK_REALTIME, &ts); ts.tv_sec += 2;
-    while (!self->port_cmd_complete)
-        pthread_cond_timedwait(&self->reconfig_cond, &self->reconfig_lock, &ts);
-    self->port_cmd_complete = FALSE;
-    pthread_mutex_unlock(&self->reconfig_lock);
     GST_DEBUG_OBJECT(self, "port reconfig: PortDisable done");
 
-    /* ── 4. Re-read output port definition ── */
-    OMX_PARAM_PORTDEFINITIONTYPE port_def;
-    port_def_init(&port_def);
-    port_def.nPortIndex = PALM_VD_PORT_OUT;
-    OMX_GetParameter(self->omx_handle, OMX_IndexParamPortDefinition, &port_def);
+    /* ── 3. Flush PORT_IN to recover any in-flight input buffers ── */
+    OMX_SendCommand(self->omx_handle, OMX_CommandFlush, PALM_VD_PORT_IN, NULL);
+    GST_DEBUG_OBJECT(self, "port reconfig: Flush PORT_IN sent");
+    g_usleep(80000); /* 80 ms — let EmptyBufferDone push to in_queue */
 
-    guint new_buf_size = port_def.nBufferSize ? port_def.nBufferSize : self->out_buf_size;
-    guint new_n_out    = port_def.nBufferCountActual ? port_def.nBufferCountActual : PALM_VD_N_OUT_BUFS;
-    if (new_n_out > PALM_VD_N_OUT_BUFS) {
-        GST_WARNING_OBJECT(self, "port reconfig: out count %d > array %d, clamping", new_n_out, PALM_VD_N_OUT_BUFS);
-        new_n_out = PALM_VD_N_OUT_BUFS;
+    /* ── 4. FreeBuffer all input buffers ── */
+    {
+        OMX_BUFFERHEADERTYPE *b;
+        while ((b = g_async_queue_try_pop(self->in_queue)) != NULL) {
+            for (guint i = 0; i < PALM_VD_N_IN_BUFS; i++) {
+                if (self->in_bufs[i] == b) {
+                    OMX_FreeBuffer(self->omx_handle, PALM_VD_PORT_IN, b);
+                    self->in_bufs[i] = NULL;
+                    break;
+                }
+            }
+        }
+        for (guint i = 0; i < PALM_VD_N_IN_BUFS; i++) {
+            if (self->in_bufs[i]) {
+                OMX_FreeBuffer(self->omx_handle, PALM_VD_PORT_IN, self->in_bufs[i]);
+                self->in_bufs[i] = NULL;
+            }
+        }
+        self->n_in_bufs = 0;
     }
-    if (port_def.format.video.nFrameWidth && port_def.format.video.nFrameHeight) {
-        self->out_width  = (gint)port_def.format.video.nFrameWidth;
-        self->out_height = (gint)port_def.format.video.nFrameHeight;
+
+    /* ── 5. Destroy old component (releases all pmem_adsp) ── */
+    self->omx_FreeHandle(self->omx_handle);
+    self->omx_handle = NULL;
+    GST_INFO_OBJECT(self, "port reconfig: old component destroyed");
+
+    /* ── 6. Create fresh component ── */
+    self->omx_state = OMX_StateLoaded;
+    self->omx_error = OMX_ErrorNone;
+    err = self->omx_GetHandle(&self->omx_handle,
+                               self->comp_name, self, &self->omx_cbs);
+    if (err != OMX_ErrorNone || !self->omx_handle) {
+        GST_ERROR_OBJECT(self, "port reconfig: GetHandle(%s) failed: 0x%x",
+                         self->comp_name, (unsigned)err);
+        pthread_mutex_lock(&self->reconfig_lock);
+        self->port_reconfig = FALSE;
+        pthread_mutex_unlock(&self->reconfig_lock);
+        return;
     }
-    self->out_buf_size = new_buf_size;
-    GST_DEBUG_OBJECT(self, "port reconfig: new out=%d×%db dim=%dx%d",
-                     new_n_out, new_buf_size, self->out_width, self->out_height);
+    GST_INFO_OBJECT(self, "port reconfig: fresh component handle=%p", (void*)self->omx_handle);
 
-    /* ── 5. Enable output port ── */
-    pthread_mutex_lock(&self->reconfig_lock);
-    self->port_cmd_complete = FALSE;
-    pthread_mutex_unlock(&self->reconfig_lock);
+    /* ── 7. Query new component's port parameters ── */
+    OMX_PARAM_PORTDEFINITIONTYPE pd_out;
+    port_def_init(&pd_out);
+    pd_out.nPortIndex = PALM_VD_PORT_OUT;
+    OMX_GetParameter(self->omx_handle, OMX_IndexParamPortDefinition, &pd_out);
+    /* NOTE: do NOT update out_width/out_height from the fresh component.
+     * A freshly GetHandle'd component returns hardware defaults (1920×1088),
+     * NOT the SPS-decoded geometry.  We saved the correct dims from the
+     * pre-destroy component above (step 0) — use those instead. */
+    guint new_n_out    = (pd_out.nBufferCountActual && pd_out.nBufferCountActual <= PALM_VD_N_OUT_BUFS)
+                         ? pd_out.nBufferCountActual : 6u;
+    guint new_buf_size = pd_out.nBufferSize ? pd_out.nBufferSize : self->out_buf_size;
 
-    err = OMX_SendCommand(self->omx_handle, OMX_CommandPortEnable, PALM_VD_PORT_OUT, NULL);
-    GST_DEBUG_OBJECT(self, "port reconfig: PortEnable cmd err=0x%x", (unsigned)err);
+    /* Set CORRECT dims (from step 0, not the fresh component's defaults) */
+    pd_out.format.video.nFrameWidth  = (OMX_U32)self->out_width;
+    pd_out.format.video.nFrameHeight = (OMX_U32)self->out_height;
+    GST_DEBUG_OBJECT(self, "port reconfig: configuring fresh component for %dx%d",
+                     self->out_width, self->out_height);
+    OMX_SetParameter(self->omx_handle, OMX_IndexParamPortDefinition, &pd_out);
 
-    /* ── 6. Allocate new output buffers (must happen while port is enabling) ── */
+    OMX_PARAM_PORTDEFINITIONTYPE pd_in;
+    port_def_init(&pd_in);
+    pd_in.nPortIndex = PALM_VD_PORT_IN;
+    OMX_GetParameter(self->omx_handle, OMX_IndexParamPortDefinition, &pd_in);
+    guint new_n_in   = pd_in.nBufferCountActual ? pd_in.nBufferCountActual : 2u;
+    if (new_n_in > PALM_VD_N_IN_BUFS) new_n_in = PALM_VD_N_IN_BUFS;
+    guint new_in_sz  = pd_in.nBufferSize ? pd_in.nBufferSize : 1048576u;
+
+    GST_DEBUG_OBJECT(self, "port reconfig: fresh in=%d×%db out=%d×%db dim=%dx%d",
+                     new_n_in, new_in_sz, new_n_out, new_buf_size,
+                     self->out_width, self->out_height);
+
+    /* ── 8. Loaded → Idle: allocate all buffers ── */
+    OMX_SendCommand(self->omx_handle, OMX_CommandStateSet, OMX_StateIdle, NULL);
+
+    for (guint i = 0; i < new_n_in; i++) {
+        err = OMX_AllocateBuffer(self->omx_handle, &self->in_bufs[i],
+                                  PALM_VD_PORT_IN, self, new_in_sz);
+        GST_DEBUG_OBJECT(self, "port reconfig: alloc in[%d] err=0x%x", i, (unsigned)err);
+        if (err == OMX_ErrorNone) self->n_in_bufs++;
+        else self->in_bufs[i] = NULL;
+    }
     for (guint i = 0; i < new_n_out; i++) {
         err = OMX_AllocateBuffer(self->omx_handle, &self->out_bufs[i],
                                   PALM_VD_PORT_OUT, self, new_buf_size);
-        GST_DEBUG_OBJECT(self, "port reconfig: AllocateBuffer out[%d] err=0x%x", i, (unsigned)err);
-        if (err == OMX_ErrorNone)
-            self->n_out_bufs++;
+        GST_DEBUG_OBJECT(self, "port reconfig: alloc out[%d] err=0x%x", i, (unsigned)err);
+        if (err == OMX_ErrorNone) self->n_out_bufs++;
+        else self->out_bufs[i] = NULL;
     }
+    self->out_buf_size = new_buf_size;
+    wait_for_state(self, OMX_StateIdle, 3000);
+    GST_INFO_OBJECT(self, "port reconfig: Idle — in=%d/%d out=%d/%d",
+                    self->n_in_bufs, new_n_in, self->n_out_bufs, new_n_out);
 
-    /* ── 7. Wait for PortEnable complete ── */
-    pthread_mutex_lock(&self->reconfig_lock);
-    clock_gettime(CLOCK_REALTIME, &ts); ts.tv_sec += 2;
-    while (!self->port_cmd_complete)
-        pthread_cond_timedwait(&self->reconfig_cond, &self->reconfig_lock, &ts);
-    self->port_cmd_complete = FALSE;
-    self->port_reconfig     = FALSE;
-    pthread_mutex_unlock(&self->reconfig_lock);
-    GST_DEBUG_OBJECT(self, "port reconfig: PortEnable done");
+    /* ── 9. Idle → Executing ── */
+    OMX_SendCommand(self->omx_handle, OMX_CommandStateSet, OMX_StateExecuting, NULL);
+    wait_for_state(self, OMX_StateExecuting, 3000);
 
-    /* ── 8. Submit all new output buffers ── */
+    /* ── 10. Submit output buffers + release input buffers to pipeline ── */
     for (guint i = 0; i < self->n_out_bufs; i++)
         OMX_FillThisBuffer(self->omx_handle, self->out_bufs[i]);
+    for (guint i = 0; i < self->n_in_bufs; i++)
+        g_async_queue_push(self->in_queue, self->in_bufs[i]);
 
-    GST_INFO_OBJECT(self, "port reconfig: complete out=%d×%db", self->n_out_bufs, new_buf_size);
+    /* Decoder state reset — resend SPS/PPS with next frame */
+    self->codec_config_sent = FALSE;
+    self->eos_sent = FALSE;
+
+    pthread_mutex_lock(&self->state_lock);
+    self->omx_error = OMX_ErrorNone;
+    pthread_mutex_unlock(&self->state_lock);
+
+    pthread_mutex_lock(&self->reconfig_lock);
+    /* Arm light_reconfig: the fresh component will fire PortSettingsChanged
+     * once more when it reads the SPS we re-send.  That event must NOT
+     * trigger another full FreeHandle+GetHandle reset (infinite loop).
+     * The output thread will call do_port_reconfig which checks light_reconfig
+     * and takes the PortDisable+drain+PortEnable path instead. */
+    self->light_reconfig          = TRUE;
+    self->port_reconfig           = FALSE;
+    self->port_cmd_complete       = FALSE;
+    /* Signal handle_frame (which is polling port_reconfig) that the reset
+     * is done and that it must re-negotiate caps with the new dimensions. */
+    self->need_output_state_update = TRUE;
+    pthread_cond_broadcast(&self->reconfig_cond);
+    pthread_mutex_unlock(&self->reconfig_lock);
+
+    GST_INFO_OBJECT(self, "port reconfig: complete (full reset) out=%d×%db",
+                    self->n_out_bufs, new_buf_size);
+}
+
+/* ── Qualcomm NV12T de-tiler (APQ8060) ──────────────────────────────────── */
+/* Tiles are 64×32. Pairs of tile rows share a block of (tiles_w * 2) tiles.
+ * Within each block, column-pairs of 4 tiles alternate which row leads:
+ *   even col_pair: even row first  (T, T, T', T')
+ *   odd  col_pair: odd  row first  (T', T', T, T)
+ *
+ * Buffer index → logical (tx, ty):
+ *   block_size = tiles_w * 2
+ *   pair_k   = idx / block_size
+ *   P        = idx % block_size
+ *   col_pair = P / 4
+ *   within   = P % 4
+ *   tx       = 2*col_pair + (within % 2)
+ *   row_sel  = even_col_pair ? (within<2 ? 0 : 1) : (within<2 ? 1 : 0)
+ *   ty       = 2*pair_k + row_sel
+ *
+ * Same ordering for both Y and UV planes.
+ */
+
+/* stride = output row stride in bytes (may differ from W due to alignment) */
+static void detile_qcom_plane(const guint8 *src, guint8 *dst,
+                               guint W, guint H, guint stride,
+                               guint tiles_w, guint tiles_h)
+{
+    const guint tile_size  = 64u * 32u;
+    const guint total      = tiles_w * tiles_h;
+    const guint block_size = tiles_w * 2u;
+
+    for (guint idx = 0; idx < total; idx++) {
+        guint pair_k   = idx / block_size;
+        guint P        = idx % block_size;
+        guint col_pair = P / 4u;
+        guint within   = P % 4u;
+        guint tx       = 2u * col_pair + (within % 2u);
+        guint row_sel  = (col_pair % 2u == 0u)
+                         ? (within < 2u ? 0u : 1u)
+                         : (within < 2u ? 1u : 0u);
+        guint ty = 2u * pair_k + row_sel;
+
+        if (tx >= tiles_w || ty >= tiles_h) continue;
+
+        const guint8 *tile = src + idx * tile_size;
+        for (guint row = 0; row < 32u; row++) {
+            guint y = ty * 32u + row;
+            if (y >= H) continue;
+            guint x0     = tx * 64u;
+            guint copy_w = (x0 + 64u <= W) ? 64u : (W - x0);
+            memcpy(dst + y * stride + x0, tile + row * 64u, copy_w);
+        }
+    }
 }
 
 /* ── Output thread ──────────────────────────────────────────────────────── */
@@ -354,8 +762,8 @@ static gpointer output_thread_func(gpointer data)
         if (!buf)
             continue;
 
-        GST_LOG_OBJECT(self, "output thread: got buf filled=%d flags=0x%x ts=%lld",
-                       (int)buf->nFilledLen, (unsigned)buf->nFlags,
+        GST_INFO_OBJECT(self, "output thread: got buf=%p filled=%d flags=0x%x ts=%lld",
+                       (void*)buf, (int)buf->nFilledLen, (unsigned)buf->nFlags,
                        (long long)buf->nTimeStamp);
 
         if (buf->nFlags & OMX_BUFFERFLAG_EOS) {
@@ -371,23 +779,67 @@ static gpointer output_thread_func(gpointer data)
             if (frame) {
                 if (gst_video_decoder_allocate_output_frame(dec, frame)
                         == GST_FLOW_OK) {
-                    GstMapInfo map;
-                    if (gst_buffer_map(frame->output_buffer, &map, GST_MAP_WRITE)) {
-                        guint copy = MIN((guint)buf->nFilledLen, (guint)map.size);
-                        memcpy(map.data, buf->pBuffer + buf->nOffset, copy);
-                        gst_buffer_unmap(frame->output_buffer, &map);
+                    GstVideoFrame vframe;
+                    if (gst_video_frame_map(&vframe, &self->vinfo,
+                                            frame->output_buffer, GST_MAP_WRITE)) {
+                        /* Qualcomm APQ8060 OMX decoder outputs NV12T tiled format.
+                         * Use GstVideoFrame to get proper plane pointers and strides
+                         * (GStreamer may align stride beyond width). */
+                        guint w  = (guint)self->out_width;
+                        guint h  = (guint)self->out_height;
+
+                        guint8 *dst_y    = GST_VIDEO_FRAME_PLANE_DATA(&vframe, 0);
+                        guint8 *dst_uv   = GST_VIDEO_FRAME_PLANE_DATA(&vframe, 1);
+                        guint   stride_y = (guint)GST_VIDEO_FRAME_PLANE_STRIDE(&vframe, 0);
+                        guint   stride_uv= (guint)GST_VIDEO_FRAME_PLANE_STRIDE(&vframe, 1);
+
+                        enum { TW = 64, TH = 32 };
+                        guint tiles_w   = (w + TW - 1) / TW;
+                        guint tile_size = (guint)(TW * TH);
+                        guint total_tile_rows = (guint)(buf->nFilledLen / (tiles_w * tile_size));
+                        guint tiles_h_y  = (total_tile_rows * 2 + 2) / 3;
+                        guint tiles_h_uv = total_tile_rows - tiles_h_y;
+                        GST_LOG_OBJECT(self,
+                            "NV12T detile: w=%u h=%u stride_y=%u stride_uv=%u "
+                            "tiles_w=%u tiles_h_y=%u tiles_h_uv=%u nFilledLen=%u",
+                            w, h, stride_y, stride_uv,
+                            tiles_w, tiles_h_y, tiles_h_uv, (guint)buf->nFilledLen);
+
+                        const guint8 *src = buf->pBuffer + buf->nOffset;
+
+                        /* Clear to neutral — prevents stale tile data from prior video */
+                        memset(dst_y,  16,  stride_y  * h);
+                        memset(dst_uv, 128, stride_uv * (h / 2u));
+
+                        /* De-tile Y and UV planes (Qualcomm NV12T boustrophedon) */
+                        detile_qcom_plane(src, dst_y, w, h, stride_y,
+                                          tiles_w, tiles_h_y);
+                        const guint8 *src_uv = src + tiles_w * tiles_h_y * tile_size;
+                        detile_qcom_plane(src_uv, dst_uv, w, h / 2u, stride_uv,
+                                          tiles_w, tiles_h_uv);
+
+                        gst_video_frame_unmap(&vframe);
                     }
                     GST_BUFFER_PTS(frame->output_buffer) =
                         (GstClockTime)((guint64)buf->nTimeStamp * 1000ULL); /* µs → ns */
                 }
+                /* Return OMX buf BEFORE finish_frame — finish_frame may block
+                 * 40-500ms on clock sync. Data already memcpy'd into GstBuffer.
+                 * Returning early keeps component fed and prevents stall. */
+                buf->nFilledLen = 0;
+                buf->nOffset    = 0;
+                OMX_FillThisBuffer(self->omx_handle, buf);
+                buf = NULL; /* already recycled */
                 gst_video_decoder_finish_frame(dec, frame);
             }
         }
 
-        /* Recycle output buffer */
-        buf->nFilledLen = 0;
-        buf->nOffset    = 0;
-        OMX_FillThisBuffer(self->omx_handle, buf);
+        /* Recycle output buffer if not already returned above */
+        if (buf) {
+            buf->nFilledLen = 0;
+            buf->nOffset    = 0;
+            OMX_FillThisBuffer(self->omx_handle, buf);
+        }
     }
 
     GST_DEBUG_OBJECT(self, "output thread exiting");
@@ -501,6 +953,7 @@ static gboolean palm_vd_set_format(GstVideoDecoder *dec,
         return FALSE;
     }
     GST_INFO_OBJECT(self, "OMX component: %s", comp_name);
+    g_strlcpy(self->comp_name, comp_name, sizeof(self->comp_name));
 
     self->omx_cbs.EventHandler    = omx_event_handler;
     self->omx_cbs.EmptyBufferDone = omx_empty_buffer_done;
@@ -620,21 +1073,36 @@ static gboolean palm_vd_set_format(GstVideoDecoder *dec,
         (unsigned)err, (int)port_def.nBufferSize,
         (int)port_def.nBufferCountActual, (int)port_def.eDomain);
 
-    /* Update output dimensions for the decoder */
+    /* Update output dimensions — do NOT force nStride/nSliceHeight.
+     * The Qualcomm OMX component pads stride to hardware alignment (typically
+     * 128 bytes). If we force stride=width the component ignores it and uses
+     * its own alignment, but the buffer size calculation uses our forced value,
+     * causing a mismatch. Let OMX decide stride, then read it back. */
     port_def.format.video.nFrameWidth  = (OMX_U32)width;
     port_def.format.video.nFrameHeight = (OMX_U32)height;
-    port_def.format.video.nStride      = (OMX_U32)width;
-    port_def.format.video.nSliceHeight = (OMX_U32)height;
+    port_def.format.video.nStride      = 0; /* let OMX pick aligned stride */
+    port_def.format.video.nSliceHeight = 0; /* let OMX pick aligned height */
     port_def.format.video.eColorFormat = (OMX_U32)OMX_COLOR_FormatYUV420SemiPlanar;
     port_def.format.video.xFramerate   = 0; /* don't constrain */
 
     err = OMX_SetParameter(self->omx_handle, OMX_IndexParamPortDefinition, &port_def);
     GST_DEBUG_OBJECT(self, "OUT port SetParameter: err=0x%x", (unsigned)err);
 
-    /* Re-read to get actual (possibly updated) buffer size */
+    /* Re-read to get actual (hardware-aligned) stride and slice height */
     port_def_init(&port_def);
     port_def.nPortIndex = PALM_VD_PORT_OUT;
     OMX_GetParameter(self->omx_handle, OMX_IndexParamPortDefinition, &port_def);
+
+    /* Use width/height as stride defaults. The Qualcomm OMX component reports
+     * stride=1920/slice_h=1088 here regardless of actual video dimensions —
+     * these are the pre-PortSettingsChanged values and are wrong. The correct
+     * values arrive via light_reconfig (PortSettingsChanged). Using width/height
+     * as safe defaults ensures pre-reconfig frames are copied correctly. */
+    self->out_stride       = (guint)width;
+    self->out_slice_height = (guint)height;
+    GST_INFO_OBJECT(self, "OMX OUT stride=%d slice_height=%d (frame %dx%d) [OMX reported stride=%d slice_h=%d, ignored until light_reconfig]",
+                    self->out_stride, self->out_slice_height, width, height,
+                    (int)port_def.format.video.nStride, (int)port_def.format.video.nSliceHeight);
 
     guint out_buf_size = port_def.nBufferSize ? port_def.nBufferSize
                          : (guint)(width * height * 3 / 2);
@@ -724,37 +1192,62 @@ static GstFlowReturn palm_vd_handle_frame(GstVideoDecoder *dec,
 {
     GstPalmVideoDec *self = GST_PALM_VIDEO_DEC(dec);
 
+    /* Wait for any active port reconfiguration to complete.
+     *
+     * During a full OMX reset (FreeHandle + GetHandle), port_reconfig is TRUE.
+     * Previously we dropped frames here, which caused "no valid frames decoded"
+     * EOS errors because ALL frames were discarded before decoding could begin.
+     *
+     * handle_frame holds the GStreamer stream lock.  do_port_reconfig runs in
+     * the output thread WITHOUT needing the stream lock, so polling here is
+     * safe — no deadlock risk.  EOS processing also needs the stream lock, so
+     * it blocks here too, which is the desired behaviour: EOS is deferred until
+     * all frames have been fed to the reset OMX component. */
+    {
+        gint64 wait_until = g_get_monotonic_time() + 10 * G_USEC_PER_SEC;
+        for (;;) {
+            pthread_mutex_lock(&self->reconfig_lock);
+            gboolean active = self->port_reconfig;
+            pthread_mutex_unlock(&self->reconfig_lock);
+            if (!active) break;
+            if (g_get_monotonic_time() > wait_until) {
+                GST_ERROR_OBJECT(self, "port reconfig wait timeout, dropping frame");
+                gst_video_codec_frame_unref(frame);
+                return GST_FLOW_ERROR;
+            }
+            g_usleep(20000); /* poll every 20 ms */
+        }
+    }
+
+    /* If do_port_reconfig updated output dimensions, re-negotiate caps.
+     * We are still holding the stream lock here, which is required for
+     * gst_video_decoder_set_output_state / gst_video_decoder_negotiate. */
+    if (self->need_output_state_update) {
+        self->need_output_state_update = FALSE;
+        GstVideoCodecState *new_st = gst_video_decoder_set_output_state(
+            dec, GST_VIDEO_FORMAT_NV12,
+            (guint)self->out_width, (guint)self->out_height, NULL);
+        gst_video_codec_state_unref(new_st);
+        gst_video_decoder_negotiate(dec);
+        GST_INFO_OBJECT(self, "handle_frame: output state updated to %dx%d",
+                        self->out_width, self->out_height);
+    }
+
     if (!self->omx_handle) {
         gst_video_codec_frame_unref(frame);
         return GST_FLOW_NOT_NEGOTIATED;
     }
 
-    /* ── Send Annex-B SPS/PPS config once before first frame ── */
-    if (self->is_avc && self->codec_config && !self->codec_config_sent) {
-        OMX_BUFFERHEADERTYPE *cbuf =
-            g_async_queue_timeout_pop(self->in_queue, 500000);
-        if (!cbuf) {
-            GST_WARNING_OBJECT(self, "no buffer for codec_config, dropping");
-        } else {
-            guint csz = MIN(self->codec_config_len, cbuf->nAllocLen);
-            memcpy(cbuf->pBuffer, self->codec_config, csz);
-            cbuf->nFilledLen = csz;
-            cbuf->nOffset    = 0;
-            cbuf->nTimeStamp = 0;
-            cbuf->nFlags     = OMX_BUFFERFLAG_CODECCONFIG;
-            GST_DEBUG_OBJECT(self, "Sending codec_config %d bytes (Annex-B SPS/PPS)", csz);
-            OMX_ERRORTYPE cerr = OMX_EmptyThisBuffer(self->omx_handle, cbuf);
-            if (cerr != OMX_ErrorNone) {
-                GST_ERROR_OBJECT(self, "EmptyThisBuffer codec_config failed: 0x%08x", (unsigned)cerr);
-                g_async_queue_push(self->in_queue, cbuf);
-            }
-        }
-        self->codec_config_sent = TRUE;
-    }
-
-    /* Get a free input buffer — block up to 500ms */
+    /* Get a free input buffer — block up to 500ms.
+     * Release the stream lock while waiting so the output thread can call
+     * get_oldest_frame / finish_frame, draining output bufs back to OMX.
+     * Without this, the output thread starves: handle_frame holds the lock
+     * for 500ms intervals, OMX stalls on full output bufs, EmptyBufferDone
+     * stops, and in_queue drains → "no free input buffer" loop. */
+    GST_VIDEO_DECODER_STREAM_UNLOCK(dec);
     OMX_BUFFERHEADERTYPE *buf =
         g_async_queue_timeout_pop(self->in_queue, 500000);
+    GST_VIDEO_DECODER_STREAM_LOCK(dec);
     if (!buf) {
         GST_WARNING_OBJECT(self, "no free input buffer, dropping frame");
         gst_video_codec_frame_unref(frame);
@@ -768,8 +1261,28 @@ static GstFlowReturn palm_vd_handle_frame(GstVideoDecoder *dec,
         return GST_FLOW_ERROR;
     }
 
-    guint copy = MIN((guint)map.size, buf->nAllocLen);
-    memcpy(buf->pBuffer, map.data, copy);
+    /* ── Prepend Annex-B SPS/PPS inline to first frame ──────────────────
+     * Sending a separate CODECCONFIG buffer causes the Qualcomm OMX decoder
+     * to stall (EmptyBufferDone never fires, OMX_ErrorHardware follows).
+     * Instead, prepend the SPS/PPS directly before the first frame's NAL
+     * data — this is what Android's MediaCodec does with Qualcomm decoders. */
+    guint prefix_len = 0;
+    if (self->is_avc && self->codec_config && !self->codec_config_sent) {
+        prefix_len = self->codec_config_len;
+        self->codec_config_sent = TRUE;
+        GST_DEBUG_OBJECT(self, "prepending %d bytes Annex-B SPS/PPS to first frame", prefix_len);
+    }
+
+    guint frame_sz = (guint)map.size;
+    guint copy = MIN(prefix_len + frame_sz, buf->nAllocLen);
+    if (prefix_len > 0 && prefix_len < buf->nAllocLen) {
+        memcpy(buf->pBuffer, self->codec_config, prefix_len);
+        guint frame_copy = MIN(frame_sz, buf->nAllocLen - prefix_len);
+        memcpy(buf->pBuffer + prefix_len, map.data, frame_copy);
+        copy = prefix_len + frame_copy;
+    } else {
+        memcpy(buf->pBuffer, map.data, copy);
+    }
     buf->nFilledLen = copy;
     buf->nOffset    = 0;
     buf->nTimeStamp = (long long)(GST_BUFFER_PTS(frame->input_buffer) / 1000LL); /* ns → µs */
@@ -777,8 +1290,9 @@ static GstFlowReturn palm_vd_handle_frame(GstVideoDecoder *dec,
 
     /* ── AVCC → Annex B in-place conversion ── */
     if (self->is_avc) {
-        guint8 *p = buf->pBuffer;
-        guint   remaining = buf->nFilledLen;
+        /* Skip over the prepended SPS/PPS prefix (already Annex B) */
+        guint8 *p = buf->pBuffer + prefix_len;
+        guint   remaining = buf->nFilledLen - prefix_len;
         guint   nls = self->nal_length_size;
         while (remaining >= nls) {
             /* Read NAL length (big-endian) */
@@ -805,8 +1319,8 @@ static GstFlowReturn palm_vd_handle_frame(GstVideoDecoder *dec,
         GST_LOG_OBJECT(self, "AVCC→AnnexB converted %d bytes", (int)buf->nFilledLen);
     }
 
-    GST_LOG_OBJECT(self, "EmptyThisBuffer: filled=%d ts=%lld flags=0x%x",
-                   (int)buf->nFilledLen, (long long)buf->nTimeStamp, (unsigned)buf->nFlags);
+    GST_INFO_OBJECT(self, "EmptyThisBuffer: buf=%p filled=%d ts=%lld flags=0x%x",
+                   (void*)buf, (int)buf->nFilledLen, (long long)buf->nTimeStamp, (unsigned)buf->nFlags);
 
     gst_buffer_unmap(frame->input_buffer, &map);
     gst_video_codec_frame_unref(frame);

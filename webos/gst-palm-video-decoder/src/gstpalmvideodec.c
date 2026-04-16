@@ -712,10 +712,19 @@ static void detile_qcom_plane(const guint8 *src, guint8 *dst,
                                guint tiles_w, guint tiles_h)
 {
     const guint tile_size  = 64u * 32u;
-    const guint total      = tiles_w * tiles_h;
     const guint block_size = tiles_w * 2u;
 
-    for (guint idx = 0; idx < total; idx++) {
+    /* Qualcomm packs only VALID tiles into the buffer — invalid boustrophedon
+     * positions (ty >= tiles_h) are omitted.  We must iterate the full logical
+     * block range (rounded up to complete 2-row pairs) but use a separate
+     * buf_idx that only advances for valid tiles so the buffer read pointer
+     * stays correct.  This matters when tiles_h is odd: the last pair-block
+     * has valid tiles interleaved with invalid ty positions in the boustrophedon
+     * sequence; using the logical idx directly would read the wrong packed slot. */
+    const guint total_logical = ((tiles_h + 1u) / 2u) * block_size;
+    guint buf_idx = 0;
+
+    for (guint idx = 0; idx < total_logical; idx++) {
         guint pair_k   = idx / block_size;
         guint P        = idx % block_size;
         guint col_pair = P / 4u;
@@ -726,9 +735,10 @@ static void detile_qcom_plane(const guint8 *src, guint8 *dst,
                          : (within < 2u ? 1u : 0u);
         guint ty = 2u * pair_k + row_sel;
 
-        if (tx >= tiles_w || ty >= tiles_h) continue;
+        if (tx >= tiles_w || ty >= tiles_h) continue;  /* invalid — no buf_idx bump */
 
-        const guint8 *tile = src + idx * tile_size;
+        const guint8 *tile = src + buf_idx * tile_size;
+        buf_idx++;
         for (guint row = 0; row < 32u; row++) {
             guint y = ty * 32u + row;
             if (y >= H) continue;
@@ -794,11 +804,28 @@ static gpointer output_thread_func(gpointer data)
                         guint   stride_uv= (guint)GST_VIDEO_FRAME_PLANE_STRIDE(&vframe, 1);
 
                         enum { TW = 64, TH = 32 };
-                        guint tiles_w   = (w + TW - 1) / TW;
-                        guint tile_size = (guint)(TW * TH);
-                        guint total_tile_rows = (guint)(buf->nFilledLen / (tiles_w * tile_size));
-                        guint tiles_h_y  = (total_tile_rows * 2 + 2) / 3;
-                        guint tiles_h_uv = total_tile_rows - tiles_h_y;
+                        guint tiles_w    = (w + TW - 1) / TW;
+                        guint tile_size  = (guint)(TW * TH);
+                        /* Compute tile counts from actual frame dimensions.
+                         * The old (total*2+2)/3 approximation broke for heights
+                         * not divisible by 64 (e.g. 480×270 → tiles_h_y=9,
+                         * tiles_h_uv=5, but formula gave 10 and 4). */
+                        guint tiles_h_y  = (h          + TH - 1) / TH;
+                        guint tiles_h_uv = (h / 2u     + TH - 1) / TH;
+                        guint expected_len = tiles_w * (tiles_h_y + tiles_h_uv) * tile_size;
+                        /* Drop frames that are too small — partial/garbage during
+                         * OMX startup or after a seek. */
+                        if (buf->nFilledLen < expected_len) {
+                            GST_WARNING_OBJECT(self,
+                                "dropping short frame: nFilledLen=%u expected=%u",
+                                (guint)buf->nFilledLen, expected_len);
+                            gst_video_frame_unmap(&vframe);
+                            gst_video_codec_frame_unref(frame);
+                            buf->nFilledLen = 0; buf->nOffset = 0;
+                            OMX_FillThisBuffer(self->omx_handle, buf);
+                            buf = NULL;
+                            continue;
+                        }
                         GST_LOG_OBJECT(self,
                             "NV12T detile: w=%u h=%u stride_y=%u stride_uv=%u "
                             "tiles_w=%u tiles_h_y=%u tiles_h_uv=%u nFilledLen=%u",

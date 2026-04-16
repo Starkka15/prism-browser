@@ -1,79 +1,155 @@
 # Prism Browser
 
-**WIP — currently in the building phase.**
+A modern web browser for the **HP TouchPad** (webOS 3.0.5, Qualcomm APQ8060).
 
-A WebKit-based web browser for Windows 10 Mobile (Lumia 1520), targeting ARM32.
+Built on WPE WebKit 2.38 with hardware H.264 video decode via the Qualcomm OMX stack. Self-contained — ships its own GStreamer, GLib, FFmpeg, and TLS stack; does not depend on the system's legacy GStreamer 0.10 or OpenSSL.
 
-## Architecture
+> **Windows 10 Mobile (Lumia 1520) port** — planned future target. WebKit WinCairo ARM32 build is in progress under `deps/`. Not the current focus.
 
-- **Shell**: UWP app (`IFrameworkView` via WRL, no XAML) — Win32 HWND hosted inside the CoreWindow
-- **Renderer**: WebKit WinCairo, C API (`WKView`, `WKPage`, `WKContext`)
-- **URL bar**: Win32 `EDIT` control (Segoe UI 24pt, VK_RETURN to navigate)
-- **Target device**: Nokia Lumia 1520 (ARM32, Windows 10 Mobile)
-- **Min OS**: 10.0.10240.0 (W10M RTM), built against SDK 10.0.16299.0
+---
 
 ## Status
 
-### Windows 10 Mobile (Lumia 1520)
-- [x] WebKit WinCairo ARM32 build (ninja, MSVC cross-compiler)
-- [x] Dependency chain (cairo, freetype, harfbuzz, pixman, curl, icu, …)
-- [ ] Prism UWP shell — compiling
-- [ ] On-device test (Lumia 1520)
+### HP TouchPad (webOS 3.0.5) — Active
 
-### HP TouchPad / webOS 3.0.5 (see `webos/`)
-- [x] Full dependency chain cross-compiled for ARMv7 / glibc 2.8
-- [x] WPE WebKit 2.38 built and linked
-- [x] SDL 1.2 + PDK EGL WPE backend (`wpe-backend-sdl`)
-- [x] `prism-browser` shell (GLib main loop, WPE view)
-- [x] IPK packaging via `palm-package`; installs via `palm-install`
-- [ ] **Blocked**: `libstdc++.so.6` UNIQUE symbol ABI issue (glibc 2.8 predates `STB_GNU_UNIQUE`)
-- [ ] EGL/WebProcess launch on-device
-- [ ] Visible rendering
+| Feature | Status |
+|---|---|
+| Web browsing (HTML5 / CSS3 / JS) | ✅ Working |
+| HTTPS / TLS 1.2–1.3 | ✅ Working (GnuTLS 3.8, 2026 CA bundle) |
+| MP4 / H.264 video streaming | ✅ Working |
+| Qualcomm hardware H.264 decode | ✅ Working (`OMX.qcom.video.decoder.avc`) |
+| WebM / MKV container | ✅ Demuxer present |
+| AAC / MP3 audio decode | ✅ Decoded (silent — no audio output yet) |
+| Audio output | ❌ No driver for GStreamer 1.x on webOS 3 |
+| VP8 / VP9 / AV1 / Theora | ❌ Not yet wired up |
+| Fullscreen video | ❌ Not yet |
+| Bookmarks / history | ❌ Not yet |
+| Downloads | ❌ Not yet |
 
-## Build
+### Windows 10 Mobile (Lumia 1520) — Planned
+
+WebKit WinCairo ARM32 build in progress. Shell and on-device testing not started.
+
+---
+
+## Architecture
+
+```
+prism-browser (PDK shell)
+  └── WPE WebKit 2.38
+        ├── WPEWebProcess / WPENetworkProcess
+        ├── WPE backend: libWPEBackend-sdl (SDL2 + EGL + PDK framebuffer)
+        └── GStreamer 1.18.6 (media pipeline)
+              ├── souphttpsrc   — HTTP/HTTPS streaming (libsoup)
+              ├── gstisomp4     — MP4/M4V demuxer
+              ├── gstmatroska   — WebM/MKV demuxer
+              ├── gstpalmvideodec — Qualcomm OMX H.264 HW decoder
+              │     └── libOmxCore.so (on-device, dlopen'd)
+              │           → OMX.qcom.video.decoder.avc
+              │           → NV12T tiled output → NV12 (inverted boustrophedon)
+              └── libgstlibav   — FFmpeg software decode (AAC, MP3, fallback)
+```
+
+**Bundled dependencies** (cross-compiled for ARMv7 / glibc 2.8):
+GLib 2.58 · ICU 67 · HarfBuzz · Cairo · FreeType · Fontconfig · libsoup · libxml2 · libepoxy · GnuTLS 3.8 · FFmpeg 6.1 · GStreamer 1.18.6 · libstdc++ 10
+
+---
+
+## Installation
+
+Requires an HP TouchPad running webOS 3.0.5 connected via USB with the Palm SDK installed on your host machine.
+
+**Download** the latest IPK from [Releases](https://github.com/Starkka15/prism-browser/releases).
+
+```sh
+# Palm SDK
+palm-install com.prism.browser_1.0.0_all.ipk
+
+# Or via novacom (no SDK required)
+novacom put file:///tmp/prism.ipk < com.prism.browser_1.0.0_all.ipk
+novacom run file:///usr/bin/palm-install -- /tmp/prism.ipk
+```
+
+Launch **Prism Browser** from the webOS launcher card stack.
+
+---
+
+## Building from Source
 
 ### Prerequisites
 
-- Windows 10 host (or VM) with Visual Studio 2022 + ARM build tools
-- WebKit WinCairo ARM32 already built (see `deps/`)
+- Linux host with GCC 10 ARM cross-compiler (`arm-none-linux-gnueabi`)
+- Palm SDK (`palm-package`) installed
+- All dependencies pre-built into `webos/out/` (see build scripts below)
 
-### Shell
+The cross-compiler is built by `~/webos-touchpad-modernize/` (crosstool-ng).
 
-```powershell
-.\build-prism.ps1
+### Build the IPK
+
+```sh
+cd webos/
+bash make-ipk.sh
+# Produces: build/com.prism.browser_1.0.0_all.ipk
 ```
 
-Produces `Prism\Release\ARM\Prism.appx` — sideload via Windows Device Portal.
+### Iterative development (fast push)
 
-### WebKit deps
+Rebuild and push individual components to a connected device without reinstalling the full IPK:
 
-See `deps/BUILD-ORDER.md` and the individual `deps/build-*.ps1` scripts.
+```sh
+# Rebuild + push the OMX video decoder plugin
+./fast-push.sh omx
 
-## Notes
+# Push libWPEWebKit (already built)
+./fast-push.sh webkit
 
-### Windows 10 Mobile
-- The HWND-child approach in UWP may not composite correctly under W10M's shell.
-  If rendering is blank on-device, the fallback plan is XAML + `SwapChainPanel`.
-- `WebKit.resources` are not bundled in the AppX; deploy them alongside the package
-  if localisation strings or the Web Inspector are needed.
+# Push both
+./fast-push.sh all
+```
 
-### webOS / HP TouchPad
+Requires `novacom` and a USB-connected TouchPad.
 
-**Current blocker**: GCC 10's `libstdc++.so.6.0.28` uses `STB_GNU_UNIQUE` symbol
-binding for C++ locale objects (e.g. `std::numpunct<char>::id`). The device's
-`ld.so` (glibc 2.8) pre-dates `STB_GNU_UNIQUE` (added in glibc 2.11) and fails
-to resolve these symbols at load time.
+### Building dependencies
 
-**Fix needed**: Rebuild `libstdc++` with `-fno-gnu-unique` (requires recompiling
-GCC 10 for `arm-none-linux-gnueabi` with `--disable-gnu-unique-object`), or
-binary-patch `STB_GNU_UNIQUE → STB_GLOBAL` and also strip version tags from the
-affected `.dynsym` entries so glibc 2.8's linker can match them.
+Each dependency has a build script in `webos/`:
 
-**Other notes**:
-- IPK must be uploaded to `/media/internal/.developer/` before `palm-install`
-  will pick it up — create that directory once via `novacom run file:///bin/mkdir -- -p /media/internal/.developer`
-- Symlinks cannot be created manually on `cryptofs` (`Operation not permitted`);
-  they must be included in the IPK via `palm-package`
-- `LD_LIBRARY_PATH` is set by the `prism` wrapper script relative to `$0`
-- System `libgoodabort.so` and `libmemcpy.so` are preloaded by `/etc/ld.so.preload`
-- `libgcc_s.so.1` is not bundled — falls through to the system copy in `/usr/lib`
+```sh
+bash build-gstreamer.sh
+bash build-gst-plugins-base.sh
+bash build-gst-plugins-good.sh
+bash build-gst-plugins-bad.sh
+bash build-gst-libav.sh
+bash build-gst-palm-video-decoder.sh
+bash build-webkit-webos.sh
+# … etc.
+```
+
+### Building the OMX plugin only
+
+```sh
+cd webos/
+export PATH="$HOME/webos-touchpad-modernize/toolchain/gcc10/bin:$PATH"
+PKG_CONFIG_PATH="out/lib/pkgconfig" ninja -C build/gst-palm-video-decoder
+```
+
+---
+
+## Qualcomm NV12T Decoder Notes
+
+The TouchPad's Qualcomm APQ8060 OMX decoder outputs `QOMX_COLOR_FormatYUV420PackedSemiPlanar32m` — a tiled NV12 format using 64×32 pixel tiles in **inverted boustrophedon** order.
+
+Key implementation details in `webos/gst-palm-video-decoder/src/gstpalmvideodec.c`:
+
+- Tile order: even column-pairs → even row first; odd column-pairs → odd row first (same formula for Y and UV planes)
+- Buffer is **packed** — invalid boustrophedon positions (ty ≥ tiles_h) are omitted; a separate `buf_idx` tracks the actual buffer read pointer
+- `tiles_h_y = ceil(H / 32)`, `tiles_h_uv = ceil((H/2) / 32)` — computed directly from display dimensions
+- Output strides come from `GST_VIDEO_FRAME_PLANE_STRIDE` (GStreamer may align beyond width)
+
+---
+
+## Device Notes
+
+- `/dev/pmem_adsp` and `/dev/msm_vidc_dec` must be `chmod a+rw` before the OMX decoder initialises — the launcher script handles this
+- GStreamer registry is cached at `/tmp/prism-gst-registry.bin`; deleted on each OMX plugin update
+- Video and temp cache stored under `/media/internal/prism/` (avoids filling the 40 MB `/tmp`)
+- `libgoodabort.so` and `libmemcpy.so` are preloaded system-wide by `/etc/ld.so.preload` — expected, not a bug
